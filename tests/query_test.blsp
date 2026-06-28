@@ -1,0 +1,43 @@
+;; Query-as-data → SQL compilation. Pure, no database needed.
+(defmodule query-test
+  (:use test)
+  (:use query))
+
+(describe "query: to-sql"
+  (test "select all"
+    (is (= (to-sql (from :users)) ["SELECT * FROM users" []])))
+  (test "columns, where, order, limit (params numbered in order)"
+    (is (= (to-sql (-> (from :users)
+                     (select [:id :name])
+                     (where [:= :email "a@b.c"])
+                     (order-by :name)
+                     (limit 10)))
+          ["SELECT id, name FROM users WHERE email = $1 ORDER BY name ASC LIMIT $2"
+           ["a@b.c" 10]])))
+  (test "repeated where conjoins with AND"
+    (is (= (to-sql (-> (from :u) (where [:> :age 18]) (where [:< :age 65])))
+          ["SELECT * FROM u WHERE (age > $1 AND age < $2)" [18 65]])))
+  (test "in expands to a placeholder per element"
+    (is (= (to-sql (-> (from :u) (where [:in :id [1 2 3]])))
+          ["SELECT * FROM u WHERE id IN ($1, $2, $3)" [1 2 3]])))
+  (test "like / is-nil / not-nil"
+    (is (= (to-sql (-> (from :u) (where [:like :name "%x%"])))
+          ["SELECT * FROM u WHERE name LIKE $1" ["%x%"]]))
+    (is (= (to-sql (-> (from :u) (where [:is-nil :deleted_at])))
+          ["SELECT * FROM u WHERE deleted_at IS NULL" []]))
+    (is (= (to-sql (-> (from :u) (where [:not-nil :email])))
+          ["SELECT * FROM u WHERE email IS NOT NULL" []])))
+  (test "or / not / nesting"
+    (is (= (to-sql (-> (from :u) (where [:or [:= :a 1] [:= :b 2]])))
+          ["SELECT * FROM u WHERE (a = $1 OR b = $2)" [1 2]]))
+    (is (= (to-sql (-> (from :u) (where [:not [:= :a 1]])))
+          ["SELECT * FROM u WHERE NOT (a = $1)" [1]])))
+  (test "order desc + offset"
+    (is (= (to-sql (-> (from :u) (order-by :id :desc) (limit 5) (offset 10)))
+          ["SELECT * FROM u ORDER BY id DESC LIMIT $1 OFFSET $2" [5 10]])))
+  (test "a query is just data — inspectable and composable"
+    (let (base (-> (from :users) (where [:= :active true])))
+      (is (= (get base :from) :users))
+      ;; extend dynamically like any map
+      (is (= (to-sql (limit base 1))
+            ["SELECT * FROM users WHERE active = $1 LIMIT $2" [true 1]])))))

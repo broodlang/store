@@ -1,9 +1,10 @@
-;; store — a Postgres driver and data-mapping layer for Brood.
+;; store — a database storage library for Brood ("like Ecto, a bit better").
 ;;
-;; "Like Ecto, a bit better": the query layer is plain data (no macro DSL, no pin
-;; operator), the wire driver is pure Brood over net/tcp's binary mode (no libpq),
-;; and LISTEN/NOTIFY is mailbox-native. This is the spike: connect → SCRAM auth →
-;; simple query → decoded rows. Layers on top (schema, changeset, repo) come next.
+;; Adaptor-agnostic: queries are plain data (no macro DSL, no pin operator),
+;; composed with ordinary functions and compiled to parameterized SQL; schema,
+;; changeset, and the repo build on that. The actual database I/O is done by a
+;; swappable *adaptor* (e.g. `store-postgres`) that implements a small contract,
+;; so the library has no dependency on any specific database driver.
 (project
   :name "store"
   :version "0.1.0")
