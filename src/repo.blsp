@@ -60,6 +60,45 @@
   "Drop the table described by `schema-map` (IF EXISTS)."
   (exec repo (schema/drop-table-sql schema-map) []))
 
+;; ---- migration diffing (reconcile a live table with a schema) ----------------
+
+(defn columns (repo table)
+  "The live column names (keywords) of `table`, via the adaptor's introspection.
+  Empty when the table doesn't exist."
+  (map (fn (c) (keyword (get c :name)))
+    ((get (get repo :adaptor) :columns) (get repo :pool) (name (if (map? table) (get table :table) table)))))
+
+(defn diff (repo schema-map)
+  "Compare `schema-map`'s :fields to the live table; return the migration as data:
+  `{:create true}` if the table is absent, else `{:add [field…] :drop [col…]}`
+  (fields to ADD, live columns to DROP — both possibly empty)."
+  (let (have (columns repo schema-map))
+    (if (empty? have)
+      {:create true}
+      (let (want (keys (get schema-map :fields))
+            have-set (reduce (fn (m c) (assoc m c true)) {} have)
+            want-set (reduce (fn (m c) (assoc m c true)) {} want))
+        {:add (into [] (filter (fn (f) (nil? (get have-set f))) want))
+         :drop (into [] (filter (fn (c) (nil? (get want-set c))) have))}))))
+
+(defn migrate (repo schema-map & opts)
+  "Reconcile the live table with `schema-map`. Creates it if absent; otherwise ADDs
+  any new fields. Pass `{:drop true}` to also DROP columns no longer in the schema
+  (off by default — it loses data). Returns the SQL statements run."
+  (let (o (if (empty? opts) {} (first opts))
+        d (diff repo schema-map)
+        table (get schema-map :table)
+        fields (get schema-map :fields))
+    (if (get d :create)
+      (do (create-table repo schema-map) [(schema/create-table-sql schema-map)])
+      (let (adds (map (fn (f) (schema/add-column-sql table f (get fields f))) (get d :add))
+            drops (if (get o :drop)
+                    (map (fn (c) (schema/drop-column-sql table c)) (get d :drop))
+                    [])
+            stmts (concat adds drops))
+        (reduce (fn (_ s) (exec repo s [])) nil stmts)
+        stmts))))
+
 ;; ---- associations / preloads ------------------------------------------------
 ;; A schema's :associations describes related tables, e.g.
 ;;   :associations
