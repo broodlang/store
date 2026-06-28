@@ -13,6 +13,14 @@
   (:alias wire/types)
   (:alias wire/scram))
 
+;; ---- errors -----------------------------------------------------------------
+
+(defn fail (kind message)
+  "Throw a tagged error so callers (the pool) can classify it: `:connection`
+  errors are fatal (the socket is gone — replace the connection), `:query` and
+  `:auth` errors leave the connection usable / are config problems."
+  (throw {:store-error kind :message (str "store: " message)}))
+
 ;; ---- connect + handshake ----------------------------------------------------
 
 (defn connect (opts)
@@ -42,7 +50,7 @@
       (= type "K") (handshake conn)   ; BackendKeyData — for cancellation; ignore here
       (= type "N") (handshake conn)   ; NoticeResponse
       (= type "Z") conn               ; ReadyForQuery — handshake complete
-      (= type "E") (throw (str "store: " (error-text body)))
+      (= type "E") (fail :auth (error-text body))
       else (handshake conn))))
 
 ;; ---- authentication ---------------------------------------------------------
@@ -57,7 +65,7 @@
       (= subtype 10) (scram-begin conn)              ; SASL — we offer SCRAM-SHA-256
       (= subtype 11) (scram-continue conn body)      ; SASLContinue (server-first)
       (= subtype 12) (scram-finish conn body)        ; SASLFinal (server signature)
-      else (throw (str "store: unsupported auth method " subtype)))))
+      else (fail :auth (str "unsupported auth method " subtype)))))
 
 (defn send-password (conn)
   (tcp-send (get conn :sock) (password-message (get conn :password)))
@@ -87,7 +95,7 @@
   (let (server-final (bytestr->utf8 (substring body 4 (string-length body))))
     (if (= (scram/finish (get conn :scram) server-final) :ok)
       (handshake conn)
-      (throw "store: SCRAM server verification failed"))))
+      (fail :auth "SCRAM server verification failed"))))
 
 (defn gen-nonce ()
   "A fresh client nonce: hex of 18 random bytes (alphanumeric — no SCRAM separators)."
@@ -128,7 +136,7 @@
       (= type "D") (collect conn (add-row acc cols body) cols)
       (= type "C") (collect conn acc cols)       ; CommandComplete
       (= type "Z") [(finalize acc cols) conn]    ; ReadyForQuery — done
-      (= type "E") (throw (str "store: " (error-text body)))
+      (= type "E") (collect-error conn body cols)
       (= type "1") (collect conn acc cols)       ; ParseComplete
       (= type "2") (collect conn acc cols)       ; BindComplete
       (= type "3") (collect conn acc cols)       ; CloseComplete
@@ -138,6 +146,19 @@
       (= type "N") (collect conn acc cols)       ; NoticeResponse
       (= type "S") (collect conn acc cols)       ; ParameterStatus mid-stream
       else (collect conn acc cols))))
+
+(defn collect-error (conn body cols)
+  "An ErrorResponse mid-query: the server still sends ReadyForQuery after it, so
+  drain to that first — then the connection stays usable. The drained conn rides on
+  the thrown error so a caught caller (the pool) can keep serving on it."
+  (let (message (error-text body)
+        conn (drain-to-ready conn))
+    (throw {:store-error :query :message (str "store: " message) :conn conn})))
+
+(defn drain-to-ready (conn)
+  (let (f (read-frame conn)
+        conn (get f 2))
+    (if (= (get f 0) "Z") conn (drain-to-ready conn))))
 
 (defn finalize (acc cols)
   "Project the column descriptors down to names for the public result."
@@ -170,8 +191,8 @@
     (let (sock (get conn :sock)
           more (receive
                  ([:tcp ~sock d] d)
-                 ([:tcp-closed ~sock] (throw "store: connection closed by server"))
-                 (after 15000 (throw "store: timed out waiting for server"))))
+                 ([:tcp-closed ~sock] (fail :connection "connection closed by server"))
+                 (after 15000 (fail :connection "timed out waiting for server"))))
       (fill-to (assoc conn :buf (str (get conn :buf) more)) n))))
 
 ;; ---- backend message decoders -----------------------------------------------
