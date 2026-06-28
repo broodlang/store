@@ -9,10 +9,11 @@
                          delivers (same convention as http/websocket);
     - a *byte vector*  — a vector of ints 0–255, what `crypto`/`hash` operate on.
 
-  This module also fills the stdlib gaps the protocol's auth needs: base64 and
-  HMAC-SHA-256 over *raw bytes* (the std versions are UTF-8-bound). HMAC here is
-  validated against RFC 4231 / the builtin in tests."
-  (:use hash))
+  Crypto/encoding now live in the stdlib's raw-byte layer (`hash/*-raw`,
+  `crypto/pbkdf2` over byte vectors, `encoding/base64-*-bytes` / `hex-*-bytes`);
+  this module is just the wire-format glue — the carrier, fixed-width ints, and
+  CStrings."
+  (:use encoding))
 
 ;; ---- byte <-> codepoint -----------------------------------------------------
 
@@ -100,110 +101,8 @@
     [(bytestr->utf8 (substring s start i)) (+ i 1)]
     (read-cstring--scan s start (+ i 1))))
 
-;; ---- base64 over raw bytes (std base64 is UTF-8-bound) ----------------------
-
-(def *b64* "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
-
-(defn b64-encode (bv)
-  "Byte vector → standard base64 string (RFC 4648, `=` padding)."
-  (b64-encode--loop bv 0 (count bv) ""))
-
-(defn b64-encode--loop (bv i n acc)
-  (if (>= i n)
-    acc
-    (let (b0 (get bv i)
-          b1 (if (< (+ i 1) n) (get bv (+ i 1)) 0)
-          b2 (if (< (+ i 2) n) (get bv (+ i 2)) 0)
-          trip (+ (* b0 65536) (* b1 256) b2)
-          c0 (char-at *b64* (bit-and (bit-shift-right trip 18) 63))
-          c1 (char-at *b64* (bit-and (bit-shift-right trip 12) 63))
-          c2 (char-at *b64* (bit-and (bit-shift-right trip 6) 63))
-          c3 (char-at *b64* (bit-and trip 63))
-          left (- n i))
-      (b64-encode--loop bv (+ i 3) n
-        (str acc c0 c1
-          (if (>= left 2) c2 "=")
-          (if (>= left 3) c3 "="))))))
-
-(defn b64-decode (s)
-  "Standard base64 string → byte vector."
-  (b64-decode--loop s 0 (string-length s) []))
-
-(defn b64-decode--loop (s i n acc)
-  (if (>= i n)
-    acc
-    (let (c2 (char-at s (+ i 2))
-          c3 (char-at s (+ i 3))
-          p2 (= c2 "=")
-          p3 (= c3 "=")
-          v0 (index-of *b64* (char-at s i))
-          v1 (index-of *b64* (char-at s (+ i 1)))
-          v2 (if p2 0 (index-of *b64* c2))
-          v3 (if p3 0 (index-of *b64* c3))
-          trip (+ (* v0 262144) (* v1 4096) (* v2 64) v3)
-          o0 (bit-and (bit-shift-right trip 16) 255)
-          o1 (bit-and (bit-shift-right trip 8) 255)
-          o2 (bit-and trip 255))
-      (b64-decode--loop s (+ i 4) n
-        (cond
-          p2 (into acc [o0])
-          p3 (into acc [o0 o1])
-          else (into acc [o0 o1 o2]))))))
-
-;; ---- hashing over raw bytes -------------------------------------------------
-
-(def *hex* "0123456789abcdef")
-
-(defn hex->bytes (s)
-  "ASCII hex string → byte vector (the std hex-decode is UTF-8-bound, so it can't
-  carry the high bytes a digest produces; this maps the ASCII nibbles directly)."
-  (into [] (map (fn (i)
-                  (+ (* 16 (index-of *hex* (char-at s (* 2 i))))
-                    (index-of *hex* (char-at s (+ (* 2 i) 1)))))
-             (range (quot (string-length s) 2)))))
-
-(defn bytes->hex (bv)
-  "Byte vector → lowercase hex string."
-  (apply str (map (fn (b)
-                    (str (char-at *hex* (quot b 16)) (char-at *hex* (rem b 16))))
-               bv)))
-
-(defn sha256v (bv)
-  "SHA-256 of a byte vector → a 32-byte vector. (`hash/sha256-bytes` returns hex.)"
-  (hex->bytes (sha256-bytes bv)))
+;; ---- byte-vector XOR (SCRAM's client proof; no stdlib equivalent) -----------
 
 (defn xor-bytes (a b)
   "XOR two equal-length byte vectors → byte vector."
   (into [] (map (fn (i) (bit-xor (get a i) (get b i))) (range (count a)))))
-
-(defn hmac256 (key msg)
-  "HMAC-SHA-256 over a byte-vector key and byte-vector message → a 32-byte vector.
-  The std `hmac-sha256` is string-only (can't carry a raw-byte key), so this builds
-  HMAC from `sha256v` per RFC 2104. Validated against the builtin in tests."
-  (let (block 64
-        k0 (if (> (count key) block) (sha256v key) key)
-        k (into [] (concat k0 (repeat (- block (count k0)) 0)))
-        ipad (into [] (map (fn (b) (bit-xor b 54)) k))
-        opad (into [] (map (fn (b) (bit-xor b 92)) k)))
-    (sha256v (into [] (concat opad
-                        (sha256v (into [] (concat ipad msg))))))))
-
-(defn pbkdf2-sha256 (password salt iterations dk-len)
-  "PBKDF2-HMAC-SHA256 over byte-vector `password` and `salt` → a `dk-len`-byte
-  vector. The std `crypto/pbkdf2` stringifies its salt as UTF-8, so it can't take a
-  binary salt (SCRAM's salt is base64-decoded bytes); this runs over `hmac256`."
-  (let (blocks (quot (+ dk-len 31) 32))
-    (into [] (take dk-len
-               (apply concat
-                 (map (fn (i) (pbkdf2--block password salt iterations (+ i 1)))
-                   (range blocks)))))))
-
-(defn pbkdf2--block (password salt iterations i)
-  (let (u1 (hmac256 password (into [] (concat salt (bytestr->bytes (int32-be i))))))
-    (pbkdf2--xor password u1 u1 (- iterations 1))))
-
-(defn pbkdf2--xor (password acc u remaining)
-  (if (<= remaining 0)
-    acc
-    (let (next (hmac256 password u))
-      (pbkdf2--xor password (xor-bytes acc next) next (- remaining 1)))))

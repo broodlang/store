@@ -1,8 +1,10 @@
-;; Wire-layer tests: byte codecs, raw-byte HMAC/base64, and the SCRAM-SHA-256 flow
-;; checked against the RFC 7677 §3 worked example. No database needed.
+;; Wire-layer tests: byte/int/cstring codecs and the SCRAM-SHA-256 flow checked
+;; against the RFC 7677 §3 worked example. The byte-level crypto (HMAC/PBKDF2/
+;; base64/hex) is now the stdlib's raw-byte layer — covered by brood's own
+;; hash_test / encoding_test / scram_bytes_test — so it isn't re-tested here.
+;; No database needed.
 (defmodule wire-test
   (:use test)
-  (:use hash)
   (:use wire/bytes)
   (:use wire/scram))
 
@@ -16,26 +18,9 @@
   (test "cstring writes a NUL terminator and reads back"
     (let (s (cstring "user"))
       (is (= (string-length s) 5))
-      (is (= (read-cstring s 0) ["user" 5])))))
-
-(describe "bytes: base64 over raw bytes"
-  (test "encodes with correct padding"
-    (is (= (b64-encode [102 111 111]) "Zm9v"))      ; "foo"
-    (is (= (b64-encode [102 111]) "Zm8="))          ; "fo"
-    (is (= (b64-encode [102]) "Zg==")))             ; "f"
-  (test "decode is the inverse of encode"
-    (is (= (b64-decode (b64-encode [0 1 2 250 251 255])) [0 1 2 250 251 255]))))
-
-(describe "bytes: HMAC-SHA-256 over raw bytes"
-  (test "matches the string builtin for ASCII inputs"
-    (let (mine (hmac256 (into [] (string->utf8-bytes "key"))
-                 (into [] (string->utf8-bytes "msg"))))
-      ;; bytes->hex inline
-      (is (= (apply str (map (fn (b)
-                               (str (char-at "0123456789abcdef" (quot b 16))
-                                 (char-at "0123456789abcdef" (rem b 16))))
-                          mine))
-            (hmac-sha256 "key" "msg"))))))
+      (is (= (read-cstring s 0) ["user" 5]))))
+  (test "xor-bytes combines two equal-length vectors"
+    (is (= (xor-bytes [1 2 3] [1 1 1]) [0 3 2]))))
 
 (describe "scram: RFC 7677 worked example"
   ;; user "user" / password "pencil" with the RFC's fixed nonce.

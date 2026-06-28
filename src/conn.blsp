@@ -8,6 +8,7 @@
   (:use net/tcp)
   (:use hash)
   (:use crypto)
+  (:use encoding)
   (:use wire/bytes)
   (:use wire/messages)
   (:alias wire/types)
@@ -99,7 +100,7 @@
 
 (defn gen-nonce ()
   "A fresh client nonce: hex of 18 random bytes (alphanumeric — no SCRAM separators)."
-  (bytes->hex (random-bytes 18)))
+  (hex-encode-bytes (random-bytes 18)))
 
 ;; ---- queries ----------------------------------------------------------------
 
