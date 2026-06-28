@@ -21,8 +21,8 @@
           "12345678901234567890.0001")))
   (test "text types pass through"
     (is (= (decode-value 25 "hello") "hello")))
-  (test "bytea hex decodes to a byte vector"
-    (is (= (decode-value *oid-bytea* "\\x4869") [72 105])))   ; "Hi" = 0x48 0x69
+  (test "bytea hex decodes to a bytes value"
+    (is (= (decode-value *oid-bytea* "\\x4869") (bytes 72 105))))   ; "Hi" = 0x48 0x69
   (test "any OID with nil text is nil"
     (is (= (decode-value *oid-int4* nil) nil))))
 

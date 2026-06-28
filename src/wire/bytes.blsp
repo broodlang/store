@@ -60,6 +60,13 @@
   "Decode a byte string holding UTF-8 back into text."
   (utf8-bytes->string (bytestr->bytes s)))
 
+(defn bytes->carrier (b)
+  "Convert a `bytes` value (what binary-mode `[:tcp …]` now delivers) to this
+  module's Latin-1 byte-string carrier, so the existing string-based frame reader
+  keeps working. (A full bytes-native rewrite of the wire codec is a clean
+  follow-up; this keeps the driver working on the migrated runtime.)"
+  (apply str (map byte->char (bytes->list b))))
+
 ;; ---- fixed-width big-endian integers ----------------------------------------
 
 (defn int32-be (n)
