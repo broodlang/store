@@ -19,21 +19,15 @@
 ;; ---- running queries --------------------------------------------------------
 
 (defn exec (repo sql params)
-  "Run raw parameterized SQL (`$1`, `$2`, …) — the escape hatch. Returns
-  `{:columns [name…] :rows [[val…]…]}`."
+  "Run raw parameterized SQL (`$1`, `$2`, …) — the escape hatch. Returns the rows
+  as maps keyed by column name (keywords); the adaptor handles the DB specifics."
   ((get (get repo :adaptor) :exec) (get repo :pool) sql params))
 
 (defn all (repo q)
   "Run query `q` and return its rows as maps keyed by column name (keywords)."
-  (let (sp (query/to-sql q)
-        result (exec repo (get sp 0) (get sp 1)))
-    (rows->maps result)))
+  (let (sp (query/to-sql q))
+    (exec repo (get sp 0) (get sp 1))))
 
 (defn one (repo q)
   "Run `q` with LIMIT 1; return the first row map, or nil if none."
   (first (all repo (query/limit q 1))))
-
-(defn rows->maps (result)
-  "Turn a `{:columns :rows}` result into a list of `{:col value …}` maps."
-  (let (cols (map keyword (get result :columns)))
-    (map (fn (row) (zipmap cols row)) (get result :rows))))
