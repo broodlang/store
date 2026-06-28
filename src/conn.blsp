@@ -194,7 +194,7 @@
                  ([:tcp ~sock d] d)
                  ([:tcp-closed ~sock] (fail :connection "connection closed by server"))
                  (after 15000 (fail :connection "timed out waiting for server"))))
-      (fill-to (assoc conn :buf (str (get conn :buf) more)) n))))
+      (fill-to (assoc conn :buf (str (get conn :buf) (bytes->carrier more))) n))))
 
 ;; ---- backend message decoders -----------------------------------------------
 
