@@ -35,3 +35,12 @@
 
 (defn drop-table-sql (s)
   (str "DROP TABLE IF EXISTS " (query/ident (get s :table))))
+
+;; ---- ALTER (for migration diffing) ------------------------------------------
+
+(defn add-column-sql (table field type)
+  (str "ALTER TABLE " (query/ident table) " ADD COLUMN "
+    (query/ident field) " " (column-type type)))
+
+(defn drop-column-sql (table field)
+  (str "ALTER TABLE " (query/ident table) " DROP COLUMN " (query/ident field)))
