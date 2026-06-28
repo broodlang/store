@@ -1,0 +1,150 @@
+(defmodule pool
+  "A fixed-size connection pool that also supervises its connections.
+
+  The pool process opens `:size` connection processes, monitors each, and respawns
+  any that die — so supervision is folded into the pool rather than split across a
+  separate supervisor (which would force a pid-reconciliation dance every restart).
+
+  Clients check a connection out, use it, and check it back in; `query`/`exec` do
+  that round-trip. Checkouts beyond the pool size queue until one frees up. State:
+
+    {:opts    connection opts, for (re)spawning
+     :members all live connection pids
+     :free    the subset currently available
+     :waiters FIFO [[from ref] …] awaiting a connection}"
+  (:alias connection))
+
+;; ---- lifecycle --------------------------------------------------------------
+
+(defn start (opts)
+  "Start a pool. `opts` is the connection opts plus `:size` (default 5). Blocks until
+  every connection is up; returns the pool pid, or throws if a connection fails."
+  (let (size (get opts :size 5)
+        parent (self)
+        r (ref)
+        pid (spawn (boot opts size parent r)))
+    (receive
+      ([:started ~r] pid)
+      ([:start-failed ~r err] (throw err)))))
+
+(defn boot (opts size parent r)
+  (let (outcome (try {:pids (open-parallel opts size)} (catch e {:error e})))
+    (if (get outcome :error)
+      (send parent [:start-failed r (get outcome :error)])
+      (let (pids (get outcome :pids))
+        (map monitor pids)
+        (send parent [:started r])
+        (run {:opts opts :members pids :free pids :waiters []})))))
+
+(defn open-parallel (opts n)
+  "Open `n` connections concurrently — each connects in its own green process, so
+  the (PBKDF2-dominated) SCRAM handshakes overlap and startup is ~one handshake, not
+  n of them. Spawn all, then collect each `[:started]`."
+  (let (parent (self)
+        pairs (into [] (map (fn (i)
+                              (let (cr (ref))
+                                {:ref cr :pid (spawn (connection/boot opts parent cr))}))
+                         (range n))))
+    (into [] (map await-started pairs))))
+
+(defn await-started (p)
+  (let (cr (get p :ref)
+        pid (get p :pid))
+    (receive
+      ([:started ~cr] pid)
+      ([:start-failed ~cr e] (throw e)))))
+
+(defn run (state)
+  (receive
+    ([:checkout from r]
+      (let (free (get state :free))
+        (if (empty? free)
+          (run (assoc state :waiters (into (get state :waiters) [[from r]])))
+          (do
+            (send from [:reply r (first free)])
+            (run (assoc state :free (rest-v free)))))))
+    ([:checkin pid]
+      ;; accept only a live member that isn't already free (ignore dead/double checkin)
+      (if (and (includes? (get state :members) pid)
+            (not (includes? (get state :free) pid)))
+        (run (give-back state pid))
+        (run state)))
+    ([:down m pid reason]
+      ;; a connection died — drop it and bring up a replacement
+      (run (respawn (remove-conn state pid))))
+    ([:stop from r]
+      (map connection/stop (get state :members))
+      (send from [:reply r :ok]))))
+
+;; ---- state helpers ----------------------------------------------------------
+
+(defn rest-v (v) (into [] (rest v)))
+
+(defn remove-pid (v pid)
+  (into [] (filter (fn (x) (not (= x pid))) v)))
+
+(defn remove-conn (state pid)
+  (assoc state
+    :members (remove-pid (get state :members) pid)
+    :free (remove-pid (get state :free) pid)))
+
+(defn give-back (state pid)
+  "Return `pid` to circulation: hand it to the next waiter, else mark it free."
+  (let (waiters (get state :waiters))
+    (if (empty? waiters)
+      (assoc state :free (into (get state :free) [pid]))
+      (let (w (first waiters))
+        (send (get w 0) [:reply (get w 1) pid])
+        (assoc state :waiters (rest-v waiters))))))
+
+(defn respawn (state)
+  "Open a fresh connection, monitor it, and put it into circulation. If reconnect
+  fails right now (e.g. the server is down), the pool runs degraded by one until the
+  next death triggers another attempt."
+  (let (outcome (try {:pid (connection/start (get state :opts))} (catch e {:error e})))
+    (if (get outcome :error)
+      state
+      (let (pid (get outcome :pid))
+        (monitor pid)
+        (give-back (assoc state :members (into (get state :members) [pid])) pid)))))
+
+;; ---- client API -------------------------------------------------------------
+
+(defn checkout (pool)
+  "Block until a connection is available; return its pid."
+  (let (r (ref))
+    (send pool [:checkout (self) r])
+    (receive ([:reply ~r pid] pid))))
+
+(defn checkin (pool pid)
+  "Return a checked-out connection to the pool."
+  (send pool [:checkin pid]))
+
+(defn with-conn (pool f)
+  "Check a connection out, run `(f pid)`, and check it back in even if `f` throws."
+  (let (pid (checkout pool))
+    (try
+      (let (result (f pid))
+        (checkin pool pid)
+        result)
+      (catch e
+        (do (checkin pool pid) (throw e))))))
+
+(defn query (pool sql)
+  "Run `sql` on a pooled connection. Returns the result map, or throws on error."
+  (unwrap (with-conn pool (fn (pid) (connection/query pid sql)))))
+
+(defn exec (pool sql params)
+  "Run parameterized `sql` with `params` on a pooled connection."
+  (unwrap (with-conn pool (fn (pid) (connection/exec pid sql params)))))
+
+(defn unwrap (tagged)
+  (if (= (get tagged 0) :ok)
+    (get tagged 1)
+    (throw (get tagged 1))))
+
+(defn stop (pool)
+  "Stop the pool and all its connections."
+  (let (r (ref))
+    (send pool [:stop (self) r])
+    (receive ([:reply ~r v] v) (after 10000 :timeout))))

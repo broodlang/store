@@ -2,7 +2,8 @@
   "Spike runner: connect to Postgres, authenticate (SCRAM-SHA-256 / md5 / cleartext),
   and run a couple of simple queries — proving the wire driver end to end against a
   real server. Connection settings come from the standard PG* environment variables."
-  (:alias conn))
+  (:alias conn)
+  (:alias pool))
 
 (defn env (name default)
   (or (getenv name) default))
@@ -37,6 +38,42 @@
     (show (get res 0))
     c))
 
+(defn demo-pool (o)
+  "Exercise the pool: sequential, concurrent (more jobs than connections), and
+  kill-and-recover."
+  (println "")
+  (println "=== pool (size 3) ===")
+  (let (p (pool/start (assoc o :size 3)))
+    (println "")
+    (println "sequential:")
+    (println "  query:" (get (pool/query p "select 'hello from the pool' as msg") :rows))
+    (println "  exec :" (get (pool/exec p "select $1::int * 2 as doubled" [21]) :rows))
+
+    (println "")
+    (println "6 concurrent jobs through 3 connections (backend pid shows reuse):")
+    (let (parent (self))
+      (map (fn (i)
+             (spawn
+               (let (res (pool/query p
+                           (str "select " i " as job, pg_backend_pid() as backend")))
+                 (send parent [:done (get res :rows)]))))
+        (range 6))
+      (map (fn (_) (receive ([:done rows] (println "  ->" rows)))) (range 6)))
+
+    (println "")
+    (println "kill a connection mid-pool; pool drops + respawns it:")
+    (let (victim (pool/checkout p))
+      (println "  killing" victim)
+      (exit victim :killed)
+      (pool/checkin p victim))   ; returning the dead pid — the pool ignores it
+    (map (fn (i)
+           (println "  post-kill query" i ":" (get (pool/query p "select 'ok' as state") :rows)))
+      (range 4))
+
+    (pool/stop p)
+    (println "")
+    (println "pool stopped.")))
+
 (defn main ()
   (let (o (opts))
     (println (str "Connecting to " (get o :user) "@" (get o :host) ":"
@@ -56,4 +93,7 @@
             c (run-exec c "select $1 as raw" ["'; drop table users; --"]))
         (conn/close c)
         (println "")
-        (println "Closed. Spike complete.")))))
+        (println "Single-connection demo done.")
+        (demo-pool o)
+        (println "")
+        (println "Spike complete.")))))

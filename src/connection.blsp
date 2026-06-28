@@ -1,0 +1,86 @@
+(defmodule connection
+  "A Postgres connection wrapped in its own process.
+
+  The process owns the socket, so the `[:tcp …]` chunks land in *its* mailbox and
+  the synchronous `conn` driver works unchanged. It serves one request at a time —
+  a PG connection is inherently serial — using the ref reply idiom (cf. std/agent).
+
+  A recoverable query error (PG ErrorResponse) is reported to the caller and the
+  process keeps serving on the drained connection. A fatal `:connection` error (dead
+  socket) is reported and then re-thrown, so the process exits and whoever monitors
+  it (the pool) can replace it."
+  (:alias conn))
+
+;; ---- lifecycle --------------------------------------------------------------
+
+(defn start (opts)
+  "Spawn a connection process and block until it has connected and authenticated.
+  Returns its pid, or throws the connect/auth error."
+  (let (parent (self)
+        r (ref)
+        pid (spawn (boot opts parent r)))
+    (receive
+      ([:started ~r] pid)
+      ([:start-failed ~r err] (throw err)))))
+
+(defn boot (opts parent r)
+  (let (outcome (try {:conn (conn/connect opts)} (catch e {:error e})))
+    (if (get outcome :error)
+      (send parent [:start-failed r (get outcome :error)])
+      (do
+        (send parent [:started r])
+        (serve-loop (get outcome :conn))))))
+
+(defn serve-loop (c)
+  (receive
+    ([:query from r sql] (handle from r (fn () (conn/query c sql))))
+    ([:exec from r sql params] (handle from r (fn () (conn/exec c sql params))))
+    ([:stop from r]
+      (conn/close c)
+      (send from [:reply r :ok]))))
+
+(defn handle (from r thunk)
+  "Run a query/exec `thunk` (returns `[result conn']`), reply `[:ok result]`, and
+  keep serving on the updated conn. A `:query` error is reported as `[:error err]`
+  and serving continues on the drained conn carried by the error; any other error
+  is reported and then re-thrown, killing the process."
+  (let (outcome (try {:ok (thunk)} (catch e {:err e})))
+    (cond
+      (get outcome :ok)
+        (let (res (get outcome :ok))
+          (send from [:reply r [:ok (get res 0)]])
+          (serve-loop (get res 1)))
+      (= (get (get outcome :err) :store-error) :query)
+        (let (err (get outcome :err))
+          (send from [:reply r [:error err]])
+          (serve-loop (get err :conn)))
+      else
+        (let (err (get outcome :err))
+          (send from [:reply r [:error err]])
+          (throw err)))))
+
+;; ---- client API (returns [:ok result] | [:error err]) -----------------------
+
+(defn request (pid build)
+  "Send a request built by `(build r)` and await its reply, monitoring `pid` so a
+  dead connection process surfaces as an error instead of hanging the caller."
+  (let (r (ref)
+        m (monitor pid))
+    (send pid (build r))
+    (receive
+      ([:reply ~r v] (do (demonitor m) v))
+      ([:down ~m _ reason]
+        [:error {:store-error :connection
+                 :message (str "store: connection process died: " reason)}]))))
+
+(defn query (pid sql)
+  "Run `sql` (no params) on connection process `pid`."
+  (request pid (fn (r) [:query (self) r sql])))
+
+(defn exec (pid sql params)
+  "Run parameterized `sql` with `params` on connection process `pid`."
+  (request pid (fn (r) [:exec (self) r sql params])))
+
+(defn stop (pid)
+  "Gracefully close and stop the connection process."
+  (request pid (fn (r) [:stop (self) r])))
