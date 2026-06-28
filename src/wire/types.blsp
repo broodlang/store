@@ -6,7 +6,8 @@
 
   Binary format (faster, exact for float/numeric) is a later refinement; the OID
   table here is the seam it will plug into."
-  (:use wire/bytes))
+  (:use wire/bytes)
+  (:use encoding))
 
 ;; ---- type OIDs (from pg_type) ----------------------------------------------
 
@@ -40,7 +41,7 @@
 
 (defn bytea->bytes (text)
   "Postgres bytea text format is `\\x` + hex; decode to a byte vector."
-  (hex->bytes (substring text 2 (string-length text))))
+  (hex-decode-bytes (substring text 2 (string-length text))))
 
 ;; ---- encode: Brood value -> wire param --------------------------------------
 
