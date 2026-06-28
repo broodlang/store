@@ -1,0 +1,133 @@
+(defmodule query
+  "Queries as plain data — the \"better than Ecto\" core. A query is just a map you
+  build and compose with ordinary functions (no macro DSL, no pin operator); it
+  compiles to parameterized SQL + a params vector, and is fully inspectable
+  (`println` it) and dynamically buildable (`if`/`cond`/`reduce` over it like any map).
+
+    (-> (from :users)
+        (where [:= :email email])      ; email is bound server-side as $1
+        (where [:> :age 18])           ; conjoined with AND
+        (order-by :name)
+        (limit 10))
+    ;; => {:from :users :where [:and [:= :email …] [:> :age 18]]
+    ;;     :order [[:name :asc]] :limit 10}
+
+  `(to-sql q)` → `[\"SELECT … WHERE … LIMIT …\" [params…]]`. Run it with `all`/`one`
+  over a pool (see the `db` module).
+
+  WHERE expressions are data too:
+    [:= col v] [:<> col v] [:> col v] [:>= col v] [:< col v] [:<= col v]
+    [:in col [v …]]  [:like col pat]  [:ilike col pat]
+    [:is-nil col]  [:not-nil col]
+    [:and e …]  [:or e …]  [:not e]")
+
+;; ---- builders (each returns a fresh query map) ------------------------------
+
+(defn from (table)
+  "Start a query against `table` (a keyword or string)."
+  {:from table})
+
+(defn select (q cols)
+  "Project specific columns (a vector of keywords/strings). Default is all columns."
+  (assoc q :select cols))
+
+(defn where (q expr)
+  "Add a condition, conjoined with any existing one via AND."
+  (let (prev (get q :where))
+    (assoc q :where (if (nil? prev) expr [:and prev expr]))))
+
+(defn or-where (q expr)
+  "Add a condition, disjoined with the existing one via OR."
+  (let (prev (get q :where))
+    (assoc q :where (if (nil? prev) expr [:or prev expr]))))
+
+(defn order-by (q col & dir)
+  "Append an ORDER BY term. `dir` is :asc (default) or :desc."
+  (let (d (if (empty? dir) :asc (first dir)))
+    (assoc q :order (into (or (get q :order) []) [[col d]]))))
+
+(defn limit (q n) (assoc q :limit n))
+(defn offset (q n) (assoc q :offset n))
+
+;; ---- identifiers + operators ------------------------------------------------
+
+(defn ident (x)
+  "A column/table name from a keyword or string. A keyword `:users.id` keeps its
+  dotted form (table-qualified); otherwise it's the bare name."
+  (if (keyword? x) (name x) (str x)))
+
+(def *cmp-ops*
+  {:= "=" :<> "<>" :!= "<>" :> ">" :>= ">=" :< "<" :<= "<="})
+
+;; ---- WHERE compiler: expr -> [sql params'] ----------------------------------
+;; `params` is the accumulator so far; each emitted value becomes the next $N.
+
+(defn placeholder (params) (str "$" (inc (count params))))
+
+(defn compile-expr (expr params)
+  (let (op (first expr))
+    (cond
+      (get *cmp-ops* op)
+        [(str (ident (second expr)) " " (get *cmp-ops* op) " " (placeholder params))
+         (into params [(nth expr 2)])]
+      (= op :and) (compile-junction "AND" (rest expr) params)
+      (= op :or) (compile-junction "OR" (rest expr) params)
+      (= op :not) (let (r (compile-expr (second expr) params))
+                    [(str "NOT (" (get r 0) ")") (get r 1)])
+      (= op :in) (compile-in (second expr) (nth expr 2) params)
+      (= op :like) [(str (ident (second expr)) " LIKE " (placeholder params))
+                    (into params [(nth expr 2)])]
+      (= op :ilike) [(str (ident (second expr)) " ILIKE " (placeholder params))
+                     (into params [(nth expr 2)])]
+      (= op :is-nil) [(str (ident (second expr)) " IS NULL") params]
+      (= op :not-nil) [(str (ident (second expr)) " IS NOT NULL") params]
+      else (throw (str "query: unknown operator " (pr-str op))))))
+
+(defn compile-junction (sep exprs params)
+  (compile-junction--acc sep exprs params []))
+
+(defn compile-junction--acc (sep exprs params sqls)
+  (if (empty? exprs)
+    [(str "(" (join (str " " sep " ") sqls) ")") params]
+    (let (r (compile-expr (first exprs) params))
+      (compile-junction--acc sep (rest exprs) (get r 1) (into sqls [(get r 0)])))))
+
+(defn compile-in (col vals params)
+  (let (start (count params)
+        phs (map (fn (i) (str "$" (+ start i 1))) (range (count vals))))
+    [(str (ident col) " IN (" (join ", " phs) ")") (into params (into [] vals))]))
+
+;; ---- clause assembly --------------------------------------------------------
+
+(defn select-cols (q)
+  (let (cols (get q :select))
+    (if (or (nil? cols) (empty? cols)) "*" (join ", " (map ident cols)))))
+
+(defn order-clause (q)
+  (let (ords (get q :order))
+    (if (or (nil? ords) (empty? ords))
+      ""
+      (str " ORDER BY "
+        (join ", "
+          (map (fn (o) (str (ident (first o)) " " (if (= (second o) :desc) "DESC" "ASC"))) ords))))))
+
+(defn limit-offset (q params)
+  "Append LIMIT/OFFSET as params (so values are bound, not interpolated). Returns
+  [sql params']."
+  (let (l (get q :limit)
+        o (get q :offset)
+        s1 (if (nil? l) "" (str " LIMIT " (placeholder params)))
+        p1 (if (nil? l) params (into params [l]))
+        s2 (if (nil? o) "" (str " OFFSET " (placeholder p1)))
+        p2 (if (nil? o) p1 (into p1 [o])))
+    [(str s1 s2) p2]))
+
+(defn to-sql (q)
+  "Compile a query map to `[sql params]`."
+  (let (head (str "SELECT " (select-cols q) " FROM " (ident (get q :from)))
+        wr (if (nil? (get q :where)) ["" []] (compile-expr (get q :where) []))
+        where-sql (if (= (get wr 0) "") "" (str " WHERE " (get wr 0)))
+        params (get wr 1)
+        order-sql (order-clause q)
+        lo (limit-offset q params))
+    [(str head where-sql order-sql (get lo 0)) (get lo 1)]))

@@ -1,0 +1,39 @@
+(defmodule repo
+  "The repo — the boundary between your code and the database.
+
+  Open it with an *adaptor* (a contract map, e.g. from `store-postgres`'s `pg/adaptor`)
+  and connection opts; run data queries through it. The adaptor performs the SQL I/O,
+  so this library stays database-agnostic. `all`/`one` take a query map (see `query`)
+  and return rows as plain maps keyed by column name."
+  (:alias query))
+
+(defn open (adaptor opts)
+  "Open a repo over `adaptor` and connection `opts` (starts the adaptor's pool).
+  Returns a repo handle; close it with `close`."
+  {:adaptor adaptor :pool ((get adaptor :start-pool) opts)})
+
+(defn close (repo)
+  "Stop the repo's connection pool."
+  ((get (get repo :adaptor) :stop-pool) (get repo :pool)))
+
+;; ---- running queries --------------------------------------------------------
+
+(defn exec (repo sql params)
+  "Run raw parameterized SQL (`$1`, `$2`, …) — the escape hatch. Returns
+  `{:columns [name…] :rows [[val…]…]}`."
+  ((get (get repo :adaptor) :exec) (get repo :pool) sql params))
+
+(defn all (repo q)
+  "Run query `q` and return its rows as maps keyed by column name (keywords)."
+  (let (sp (query/to-sql q)
+        result (exec repo (get sp 0) (get sp 1)))
+    (rows->maps result)))
+
+(defn one (repo q)
+  "Run `q` with LIMIT 1; return the first row map, or nil if none."
+  (first (all repo (query/limit q 1))))
+
+(defn rows->maps (result)
+  "Turn a `{:columns :rows}` result into a list of `{:col value …}` maps."
+  (let (cols (map keyword (get result :columns)))
+    (map (fn (row) (zipmap cols row)) (get result :rows))))
