@@ -1,0 +1,64 @@
+(defmodule wire/types
+  "Type codecs: map Postgres values (text format) to/from Brood values, keyed by the
+  column's type OID. We request *text*-format results and send *text*-format params,
+  so every type round-trips through its textual form — universal, and enough to give
+  callers real Brood values (ints, floats, bools, byte vectors) instead of strings.
+
+  Binary format (faster, exact for float/numeric) is a later refinement; the OID
+  table here is the seam it will plug into."
+  (:use wire/bytes))
+
+;; ---- type OIDs (from pg_type) ----------------------------------------------
+
+(def *oid-bool* 16)
+(def *oid-bytea* 17)
+(def *oid-int8* 20)
+(def *oid-int2* 21)
+(def *oid-int4* 23)
+(def *oid-oid* 26)
+(def *oid-float4* 700)
+(def *oid-float8* 701)
+(def *oid-numeric* 1700)
+
+(def *int-oids* [*oid-int8* *oid-int2* *oid-int4* *oid-oid*])
+(def *float-oids* [*oid-float4* *oid-float8*])
+
+;; ---- decode: server text -> Brood value -------------------------------------
+
+(defn decode-value (oid text)
+  "Decode a text-format column value (already a Brood string) to a Brood value,
+  using its type OID. NULL is handled by the caller (passed as nil)."
+  (cond
+    (nil? text) nil
+    (= oid *oid-bool*) (= text "t")
+    (includes? *int-oids* oid) (string->number text)
+    (includes? *float-oids* oid) (string->number text)
+    (= oid *oid-bytea*) (bytea->bytes text)
+    ;; numeric stays a string to preserve precision (no Brood decimal type yet);
+    ;; text/varchar/uuid/json/timestamp/date/time all pass through as strings.
+    else text))
+
+(defn bytea->bytes (text)
+  "Postgres bytea text format is `\\x` + hex; decode to a byte vector."
+  (hex->bytes (substring text 2 (string-length text))))
+
+;; ---- encode: Brood value -> wire param --------------------------------------
+
+(defn encode-param (value)
+  "Encode one bound parameter as a Bind wire fragment: Int32 length + UTF-8 bytes,
+  or Int32 -1 for SQL NULL. Sent in text format, so the server casts per the column
+  type it inferred at Parse."
+  (if (nil? value)
+    (int32-be 4294967295)  ; length -1 → SQL NULL
+    (let (bytes (utf8-bytestr (param->text value)))
+      (str (int32-be (string-length bytes)) bytes))))
+
+(defn param->text (value)
+  "Brood value → its Postgres text-format literal."
+  (cond
+    (= value true) "t"
+    (= value false) "f"
+    (string? value) value
+    (int? value) (number->string value)
+    (float? value) (number->string value)
+    else (str value)))

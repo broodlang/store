@@ -1,0 +1,70 @@
+(defmodule wire/scram
+  "SCRAM-SHA-256 client flow (RFC 5802 / RFC 7677) — Postgres's default auth.
+
+  Three steps, threading a state map:
+    (start user password nonce)  -> {… :first  <client-first text>}
+    (continue state server-first) -> {… :final  <client-final text>}
+    (finish state server-final)  -> :ok | [:error why]
+
+  The text these return is the SASL payload; wire/messages wraps it in the SASL
+  frames. Channel binding is not used (gs2 header `n,,`, so the proof's `c=biws`).
+  Crypto: pbkdf2-sha256 + hmac256/sha256v, all from wire/bytes (the std crypto
+  versions are UTF-8-bound and can't carry the binary salt/keys SCRAM needs)."
+  (:use wire/bytes))
+
+(defn s->bv (s)
+  "Text → its UTF-8 byte vector (SCRAM messages are ASCII)."
+  (into [] (string->utf8-bytes s)))
+
+(defn start (user password nonce)
+  "Begin SCRAM: build client-first. `nonce` is the caller's random client nonce."
+  (let (bare (str "n=" user ",r=" nonce))
+    {:password password
+     :bare bare
+     :first (str "n,," bare)}))
+
+(defn attr (parts key)
+  "Pull attribute `key` (e.g. \"r\") from comma-split `key=value` parts."
+  (let (prefix (str key "="))
+    (attr--find parts prefix)))
+
+(defn attr--find (parts prefix)
+  (cond
+    (empty? parts) nil
+    (string-prefix? (first parts) prefix)
+      (substring (first parts) (string-length prefix) (string-length (first parts)))
+    else (attr--find (rest parts) prefix)))
+
+(defn string-prefix? (s prefix)
+  (and (>= (string-length s) (string-length prefix))
+    (= (substring s 0 (string-length prefix)) prefix)))
+
+(defn continue (state server-first)
+  "Process server-first; compute the client proof and the expected server signature.
+  Returns the state extended with `:final` (client-final text) and `:server-sig`."
+  (let (parts (string-split server-first ",")
+        rnonce (attr parts "r")
+        salt (b64-decode (attr parts "s"))
+        iters (string->number (attr parts "i"))
+        salted (pbkdf2-sha256 (s->bv (get state :password)) salt iters 32)
+        client-key (hmac256 salted (s->bv "Client Key"))
+        stored-key (sha256v client-key)
+        final-bare (str "c=biws,r=" rnonce)
+        auth-message (str (get state :bare) "," server-first "," final-bare)
+        client-sig (hmac256 stored-key (s->bv auth-message))
+        proof (xor-bytes client-key client-sig)
+        server-key (hmac256 salted (s->bv "Server Key"))
+        server-sig (hmac256 server-key (s->bv auth-message)))
+    (merge state
+      {:server-sig server-sig
+       :final (str final-bare ",p=" (b64-encode proof))})))
+
+(defn finish (state server-final)
+  "Verify the server's signature from server-final (`v=…`). Proves mutual auth —
+  the server knew the stored key, not just that our proof validated."
+  (let (parts (string-split server-final ",")
+        v (attr parts "v")
+        expected (b64-encode (get state :server-sig)))
+    (if (= v expected)
+      :ok
+      [:error "scram: server signature mismatch"])))

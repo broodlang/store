@@ -1,0 +1,44 @@
+;; Type-codec tests: decoding server text by OID, and encoding bound parameters.
+;; No database needed — these are pure functions over the text wire format.
+(defmodule types-test
+  (:use test)
+  (:use wire/bytes)
+  (:use wire/types))
+
+(describe "types: decode server text by OID"
+  (test "bool"
+    (is (= (decode-value *oid-bool* "t") true))
+    (is (= (decode-value *oid-bool* "f") false)))
+  (test "integers decode to ints"
+    (is (= (decode-value *oid-int4* "42") 42))
+    (is (= (decode-value *oid-int8* "9999999999") 9999999999))
+    (is (= (decode-value *oid-int2* "-7") -7)))
+  (test "floats decode to floats"
+    (is (= (decode-value *oid-float8* "2.5") 2.5)))
+  (test "numeric stays a string (lossless precision)"
+    (is (= (decode-value *oid-numeric* "9.99") "9.99"))
+    (is (= (decode-value *oid-numeric* "12345678901234567890.0001")
+          "12345678901234567890.0001")))
+  (test "text types pass through"
+    (is (= (decode-value 25 "hello") "hello")))
+  (test "bytea hex decodes to a byte vector"
+    (is (= (decode-value *oid-bytea* "\\x4869") [72 105])))   ; "Hi" = 0x48 0x69
+  (test "any OID with nil text is nil"
+    (is (= (decode-value *oid-int4* nil) nil))))
+
+(describe "types: encode bound parameters"
+  (test "nil becomes a -1 length (SQL NULL), no value bytes"
+    (let (p (encode-param nil))
+      (is (= (string-length p) 4))
+      (is (= (byte-at p 0) 255))
+      (is (= (byte-at p 3) 255))))
+  (test "an int is length-prefixed text"
+    (let (p (encode-param 42))
+      (is (= (read-int32 p 0) 2))           ; length of "42"
+      (is (= (substring p 4 (string-length p)) "42"))))
+  (test "param->text renders Brood values as Postgres literals"
+    (is (= (param->text true) "t"))
+    (is (= (param->text false) "f"))
+    (is (= (param->text 42) "42"))
+    (is (= (param->text 2.5) "2.5"))
+    (is (= (param->text "ada") "ada"))))

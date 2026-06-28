@@ -1,0 +1,9 @@
+;; store — a Postgres driver and data-mapping layer for Brood.
+;;
+;; "Like Ecto, a bit better": the query layer is plain data (no macro DSL, no pin
+;; operator), the wire driver is pure Brood over net/tcp's binary mode (no libpq),
+;; and LISTEN/NOTIFY is mailbox-native. This is the spike: connect → SCRAM auth →
+;; simple query → decoded rows. Layers on top (schema, changeset, repo) come next.
+(project
+  :name "store"
+  :version "0.1.0")
