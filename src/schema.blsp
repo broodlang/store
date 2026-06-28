@@ -1,0 +1,37 @@
+(defmodule schema
+  "Schema as data — one source of truth for a table's shape, from which the
+  migration (CREATE TABLE) is *derived*, so the two can't drift (an Ecto pain).
+  A schema is a plain map:
+
+    {:table  :users
+     :fields {:id :integer :name :text :age :integer :balance :numeric}
+     :primary-key :id}
+
+  `create-table-sql` / `drop-table-sql` render portable DDL; `repo/create-table` and
+  `repo/drop-table` run it. Field types are an abstract vocabulary mapped to SQL that
+  both Postgres and SQLite accept (SQLite via type affinity): :integer :text :real
+  :numeric :boolean (and aliases :int/:string/:float/:bool/:decimal). An unknown type
+  is emitted verbatim — the escape hatch for DB-specific column types."
+  (:alias query))
+
+(def *type-sql*
+  {:integer "integer" :int "integer"
+   :text "text" :string "text"
+   :real "real" :float "real"
+   :numeric "numeric" :decimal "numeric"
+   :boolean "boolean" :bool "boolean"})
+
+(defn column-type (t)
+  (or (get *type-sql* t) (name t)))
+
+(defn create-table-sql (s)
+  "Render `CREATE TABLE` from a schema map."
+  (let (fields (get s :fields)
+        cols (map (fn (f) (str (query/ident f) " " (column-type (get fields f))))
+               (keys fields))
+        pk (get s :primary-key)
+        pk-sql (if (nil? pk) "" (str ", PRIMARY KEY (" (query/ident pk) ")")))
+    (str "CREATE TABLE " (query/ident (get s :table)) " (" (join ", " cols) pk-sql ")")))
+
+(defn drop-table-sql (s)
+  (str "DROP TABLE IF EXISTS " (query/ident (get s :table))))

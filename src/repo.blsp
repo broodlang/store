@@ -5,7 +5,8 @@
   and connection opts; run data queries through it. The adaptor performs the SQL I/O,
   so this library stays database-agnostic. `all`/`one` take a query map (see `query`)
   and return rows as plain maps keyed by column name."
-  (:alias query))
+  (:alias query)
+  (:alias schema))
 
 (defn open (adaptor opts)
   "Open a repo over `adaptor` and connection `opts` (starts the adaptor's pool).
@@ -31,3 +32,44 @@
 (defn one (repo q)
   "Run `q` with LIMIT 1; return the first row map, or nil if none."
   (first (all repo (query/limit q 1))))
+
+;; ---- writes -----------------------------------------------------------------
+
+(defn insert (repo table row)
+  "Insert one `{:col value …}` row into `table`; return the inserted row map."
+  (let (sp (query/insert-sql table row))
+    (first (exec repo (get sp 0) (get sp 1)))))
+
+(defn update (repo table changes where-expr)
+  "Set `changes` on rows of `table` matching `where-expr`; return the updated rows."
+  (let (sp (query/update-sql table changes where-expr))
+    (exec repo (get sp 0) (get sp 1))))
+
+(defn delete (repo table where-expr)
+  "Delete rows of `table` matching `where-expr`; return the deleted rows."
+  (let (sp (query/delete-sql table where-expr))
+    (exec repo (get sp 0) (get sp 1))))
+
+;; ---- migrations (derived from a schema) -------------------------------------
+
+(defn create-table (repo schema-map)
+  "Create the table described by `schema-map` (see the `schema` module)."
+  (exec repo (schema/create-table-sql schema-map) []))
+
+(defn drop-table (repo schema-map)
+  "Drop the table described by `schema-map` (IF EXISTS)."
+  (exec repo (schema/drop-table-sql schema-map) []))
+
+;; ---- transactions -----------------------------------------------------------
+
+(defn transaction (repo f)
+  "Run `(f tx)` inside a database transaction. `tx` is a repo bound to the
+  transaction's single connection — use the same `all`/`one`/`insert`/`update`/
+  `delete`/`exec` on it. Commits if `f` returns; rolls back and re-raises if `f`
+  throws. Returns `f`'s value. (Adaptor-dependent: store-postgres is fully
+  transactional; an adaptor that can't support it raises.)"
+  ((get (get repo :adaptor) :transaction)
+   (get repo :pool)
+   (fn (tx-exec)
+     (f {:adaptor {:exec (fn (_ sql params) (tx-exec sql params))}
+         :pool nil}))))

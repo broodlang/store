@@ -41,3 +41,14 @@
       ;; extend dynamically like any map
       (is (= (to-sql (limit base 1))
             ["SELECT * FROM users WHERE active = $1 LIMIT $2" [true 1]])))))
+
+(describe "query: DML"
+  (test "insert-sql (single column → deterministic)"
+    (is (= (insert-sql :users {:name "ada"})
+          ["INSERT INTO users (name) VALUES ($1) RETURNING *" ["ada"]])))
+  (test "update-sql — SET params first, then WHERE"
+    (is (= (update-sql :users {:name "x"} [:= :id 5])
+          ["UPDATE users SET name = $1 WHERE id = $2 RETURNING *" ["x" 5]])))
+  (test "delete-sql"
+    (is (= (delete-sql :users [:= :id 5])
+          ["DELETE FROM users WHERE id = $1 RETURNING *" [5]]))))
