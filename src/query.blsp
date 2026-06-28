@@ -131,3 +131,32 @@
         order-sql (order-clause q)
         lo (limit-offset q params))
     [(str head where-sql order-sql (get lo 0)) (get lo 1)]))
+
+;; ---- DML: insert / update / delete (data in, [sql params] out) --------------
+;; All use `RETURNING *` so the repo gets the affected rows back (Postgres always;
+;; SQLite ≥ 3.35). Columns/values are derived from the same `keys` call so they align.
+
+(defn insert-sql (table row)
+  "`row` is a `{:col value …}` map → INSERT … VALUES (…) RETURNING *."
+  (let (cols (keys row)
+        params (into [] (map (fn (k) (get row k)) cols))
+        colnames (join ", " (map ident cols))
+        phs (join ", " (map (fn (i) (str "$" (inc i))) (range (count cols)))))
+    [(str "INSERT INTO " (ident table) " (" colnames ") VALUES (" phs ") RETURNING *")
+     params]))
+
+(defn update-sql (table changes where-expr)
+  "`changes` is a `{:col new-value …}` map → UPDATE … SET … WHERE … RETURNING *.
+  The SET values are `$1…$k`; the WHERE placeholders continue from `$k+1`."
+  (let (cols (keys changes)
+        set-vals (into [] (map (fn (k) (get changes k)) cols))
+        set-sql (join ", " (map (fn (i) (str (ident (nth cols i)) " = $" (inc i)))
+                             (range (count cols))))
+        wr (compile-expr where-expr set-vals))
+    [(str "UPDATE " (ident table) " SET " set-sql " WHERE " (get wr 0) " RETURNING *")
+     (get wr 1)]))
+
+(defn delete-sql (table where-expr)
+  "DELETE FROM table WHERE … RETURNING *."
+  (let (wr (compile-expr where-expr []))
+    [(str "DELETE FROM " (ident table) " WHERE " (get wr 0) " RETURNING *") (get wr 1)]))

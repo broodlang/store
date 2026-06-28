@@ -1,0 +1,62 @@
+(defmodule changeset
+  "Changesets — validate and shape untrusted input *before* it touches the database,
+  kept separate from the schema (Ecto's best idea, minus the ceremony). A changeset
+  is a plain map threaded through ordinary functions:
+
+    (-> (change params)
+        (cast [:name :email :age])         ; pick allowed fields from params
+        (validate-required [:name :email]) ; must be present and non-blank
+        (validate :age (fn (a) (>= a 0)) \"must be non-negative\"))
+
+  Then `(valid? cs)` / `(errors cs)` / `(changes cs)`. For an update, seed with the
+  existing record: `(change record params)`; `(apply-changes cs)` is the merged
+  result. No macros, no DB — `unique`-style checks that need the database live on
+  the repo.")
+
+(defn change (& args)
+  "Start a changeset. `(change params)` for an insert; `(change record params)` for
+  an update (record is the existing row)."
+  (if (= (count args) 1)
+    {:data {} :params (first args) :changes {} :errors [] :valid? true}
+    {:data (first args) :params (second args) :changes {} :errors [] :valid? true}))
+
+(defn cast (cs fields)
+  "Copy each of the allowed `fields` from params into changes — but only those
+  actually present in params (so a partial update touches only what was sent). This
+  is the allowlist that stops mass-assignment."
+  (let (params (get cs :params))
+    (assoc cs :changes
+      (reduce (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))
+        (get cs :changes) fields))))
+
+(defn put-change (cs field value)
+  "Force a change programmatically (e.g. a derived/defaulted field)."
+  (assoc cs :changes (assoc (get cs :changes) field value)))
+
+(defn add-error (cs field message)
+  "Record an error on `field` and mark the changeset invalid."
+  (assoc cs
+    :errors (into (get cs :errors) [[field message]])
+    :valid? false))
+
+(defn validate-required (cs fields)
+  "Each of `fields` must be present in changes and non-nil / non-blank."
+  (reduce (fn (c f)
+            (let (v (get (get c :changes) f))
+              (if (or (nil? v) (= v "")) (add-error c f "is required") c)))
+    cs fields))
+
+(defn validate (cs field pred message)
+  "If `field` is set in changes and `(pred value)` is false, add `message`."
+  (let (v (get (get cs :changes) field))
+    (if (and (not (nil? v)) (not (pred v))) (add-error cs field message) cs)))
+
+;; ---- accessors --------------------------------------------------------------
+
+(defn valid? (cs) (get cs :valid?))
+(defn errors (cs) (get cs :errors))
+(defn changes (cs) (get cs :changes))
+
+(defn apply-changes (cs)
+  "The resulting record: the seed data with the changes applied."
+  (merge (get cs :data) (get cs :changes)))

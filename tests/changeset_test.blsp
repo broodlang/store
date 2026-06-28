@@ -1,0 +1,33 @@
+;; Changesets — pure validation/cast pipeline. No database.
+(defmodule changeset-test
+  (:use test)
+  (:use changeset))
+
+(describe "changeset"
+  (test "cast keeps only allowed fields present in params (mass-assignment guard)"
+    (let (cs (-> (change {:name "ada" :email "a@b" :role "admin"})
+               (cast [:name :email])))
+      (is (= (changes cs) {:name "ada" :email "a@b"}))
+      (is (valid? cs))))
+  (test "validate-required flags missing and blank fields"
+    (let (cs (-> (change {:name ""})
+               (cast [:name :email])
+               (validate-required [:name :email])))
+      (refute (valid? cs))
+      (is (= (count (errors cs)) 2))))
+  (test "validate runs a predicate on a present field"
+    (let (cs (-> (change {:age -5})
+               (cast [:age])
+               (validate :age (fn (a) (>= a 0)) "must be non-negative")))
+      (refute (valid? cs))
+      (is (= (errors cs) [[:age "must be non-negative"]]))))
+  (test "a passing pipeline yields changes + apply-changes (update form)"
+    (let (cs (-> (change {:id 1 :name "old"} {:name "new" :ignored 9})
+               (cast [:name])
+               (validate-required [:name])
+               (validate :name (fn (n) (> (count n) 0)) "blank")))
+      (is (valid? cs))
+      (is (= (changes cs) {:name "new"}))
+      (is (= (apply-changes cs) {:id 1 :name "new"}))))
+  (test "put-change sets a derived field"
+    (is (= (changes (-> (change {}) (put-change :slug "x"))) {:slug "x"}))))
