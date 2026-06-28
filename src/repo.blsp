@@ -60,6 +60,64 @@
   "Drop the table described by `schema-map` (IF EXISTS)."
   (exec repo (schema/drop-table-sql schema-map) []))
 
+;; ---- associations / preloads ------------------------------------------------
+;; A schema's :associations describes related tables, e.g.
+;;   :associations {:posts  {:type :has-many   :table :posts :fk :author_id}
+;;                  :author {:type :belongs-to :table :users :fk :author_id :references :id}}
+;; preload eager-loads them with ONE query per association (no N+1): it gathers the
+;; keys across all rows, fetches the related rows in a single `… WHERE k IN (…)`,
+;; and attaches them — a list for :has-many, a single row (or nil) for :has-one /
+;; :belongs-to.
+
+(defn preload (repo schema rows assocs)
+  "Load association(s) onto `rows` (a list of row-maps) using `schema`'s
+  :associations. `assocs` is one key or a vector of keys."
+  (reduce (fn (rs a) (preload--one repo schema rs a))
+    rows
+    (if (keyword? assocs) [assocs] assocs)))
+
+(defn preload--one (repo schema rows akey)
+  (let (rel (get (get schema :associations) akey))
+    (cond
+      (nil? rel) (throw (str "preload: schema has no association " (pr-str akey)))
+      (= (get rel :type) :has-many) (preload--has-many repo rows akey rel (get schema :primary-key))
+      (= (get rel :type) :has-one) (preload--has-one repo rows akey rel (get schema :primary-key))
+      (= (get rel :type) :belongs-to) (preload--belongs-to repo rows akey rel)
+      else (throw (str "preload: unknown association type " (pr-str (get rel :type)))))))
+
+;; has-many / has-one: child.fk references the parent's key; fetch children whose fk
+;; is in the parents' keys, grouped by fk.
+(defn preload--children (repo rows rel parent-key)
+  (let (ref (or (get rel :references) parent-key)
+        fk (get rel :fk)
+        ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r ref)) rows)))
+        kids (if (empty? ids)
+               []
+               (all repo (-> (query/from (get rel :table)) (query/where [:in fk ids])))))
+    [ref (group-by (fn (c) (get c fk)) kids)]))
+
+(defn preload--has-many (repo rows akey rel parent-key)
+  (let (g (preload--children repo rows rel parent-key)
+        ref (get g 0) grouped (get g 1))
+    (map (fn (r) (assoc r akey (or (get grouped (get r ref)) []))) rows)))
+
+(defn preload--has-one (repo rows akey rel parent-key)
+  (let (g (preload--children repo rows rel parent-key)
+        ref (get g 0) grouped (get g 1))
+    (map (fn (r) (assoc r akey (first (get grouped (get r ref))))) rows)))
+
+;; belongs-to: this row's fk references the parent table's key; fetch those parents
+;; and attach the single match.
+(defn preload--belongs-to (repo rows akey rel)
+  (let (fk (get rel :fk)
+        ref (or (get rel :references) :id)
+        ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r fk)) rows)))
+        parents (if (empty? ids)
+                  []
+                  (all repo (-> (query/from (get rel :table)) (query/where [:in ref ids]))))
+        index (reduce (fn (m p) (assoc m (get p ref) p)) {} parents))
+    (map (fn (r) (assoc r akey (get index (get r fk)))) rows)))
+
 ;; ---- transactions -----------------------------------------------------------
 
 (defn transaction (repo f)
