@@ -1,0 +1,80 @@
+(defmodule wire/messages
+  "Frontend (client → server) message encoders for the Postgres v3 protocol.
+
+  Every message but the startup packet is `Byte1 type · Int32 length · body`, where
+  the length counts itself but not the type byte. Each returns a *byte string* ready
+  for `tcp-send` on a binary-mode socket. Backend-message decoding lives in `conn`."
+  (:use wire/bytes)
+  (:alias wire/types))
+
+(def *protocol-version* 196608) ; 3.0, encoded as 0x00030000
+
+(defn framed (type body)
+  "Wrap `body` in a typed message: type byte, Int32 self-inclusive length, body."
+  (str type (int32-be (+ 4 (string-length body))) body))
+
+(defn startup-message (user database)
+  "StartupMessage (no type byte): protocol version then NUL-terminated key/value
+  parameter pairs, ended by a final zero byte."
+  (let (params (str (cstring "user") (cstring user)
+                 (if (nil? database) "" (str (cstring "database") (cstring database)))
+                 "\x00")
+        body (str (int32-be *protocol-version*) params))
+    (str (int32-be (+ 4 (string-length body))) body)))
+
+(defn password-message (text)
+  "PasswordMessage ('p') for cleartext / md5 auth: a single CString."
+  (framed "p" (cstring text)))
+
+(defn sasl-initial (mechanism client-first)
+  "SASLInitialResponse ('p'): the chosen mechanism name (CString), then the SASL
+  data length (Int32) and the data itself (client-first)."
+  (let (data (utf8-bytestr client-first))
+    (framed "p" (str (cstring mechanism) (int32-be (string-length data)) data))))
+
+(defn sasl-response (client-final)
+  "SASLResponse ('p'): raw SASL data (client-final), no length prefix."
+  (framed "p" (utf8-bytestr client-final)))
+
+(defn query-message (sql)
+  "Query ('Q') for the simple query protocol: one CString of SQL."
+  (framed "Q" (cstring sql)))
+
+(defn terminate-message ()
+  "Terminate ('X'): graceful close, no body."
+  (framed "X" ""))
+
+;; ---- extended query protocol (Parse/Bind/Describe/Execute/Sync) -------------
+
+(defn parse-message (name sql)
+  "Parse ('P'): name a prepared statement (\"\" = unnamed), give its SQL, and pass
+  zero parameter type OIDs so the server infers them from the query."
+  (framed "P" (str (cstring name) (cstring sql) (int16-be 0))))
+
+(defn bind-message (portal statement params)
+  "Bind ('B'): bind `params` into `statement`, producing `portal`. We send one
+  parameter-format-code-count of 0 (⇒ all params text), the parameter values, and a
+  result-format-code-count of 0 (⇒ all results text)."
+  (framed "B"
+    (str (cstring portal) (cstring statement)
+      (int16-be 0)                                  ; param format codes: 0 ⇒ all text
+      (int16-be (count params))
+      (apply str (map types/encode-param params))
+      (int16-be 0))))                               ; result format codes: 0 ⇒ all text
+
+(defn describe-message (kind name)
+  "Describe ('D'): `kind` is \"S\" (statement) or \"P\" (portal). Describing a portal
+  makes the server send a RowDescription so we learn the result column type OIDs."
+  (framed "D" (str kind (cstring name))))
+
+(defn execute-message (portal max-rows)
+  "Execute ('E'): run `portal`, returning at most `max-rows` (0 = all)."
+  (framed "E" (str (cstring portal) (int32-be max-rows))))
+
+(defn sync-message ()
+  "Sync ('S'): close the implicit transaction and ask for ReadyForQuery."
+  (framed "S" ""))
+
+(defn close-message (kind name)
+  "Close ('C'): release a statement (\"S\") or portal (\"P\")."
+  (framed "C" (str kind (cstring name))))

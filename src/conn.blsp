@@ -1,0 +1,235 @@
+(defmodule conn
+  "A Postgres connection: connect, authenticate, run simple queries.
+
+  This is the spike — it runs in the caller's process (which owns the socket, so
+  `[:tcp …]` chunks arrive in its mailbox). A pooled, gen-server-wrapped connection
+  comes next. Backend messages are reassembled from raw chunks by `read-frame`,
+  which buffers in the conn map and blocks on `receive` until a full frame is in."
+  (:use net/tcp)
+  (:use hash)
+  (:use crypto)
+  (:use wire/bytes)
+  (:use wire/messages)
+  (:alias wire/types)
+  (:alias wire/scram))
+
+;; ---- connect + handshake ----------------------------------------------------
+
+(defn connect (opts)
+  "Open a connection and complete startup + auth. `opts`: :host :port :user
+  :password :database. Returns a conn map ready for `query`."
+  (let (host (get opts :host "127.0.0.1")
+        port (get opts :port 5432)
+        sock (tcp-connect host port))
+    (tcp-set-binary sock true)
+    (tcp-send sock (startup-message (get opts :user) (get opts :database)))
+    (handshake {:sock sock
+                :user (get opts :user)
+                :password (get opts :password)
+                :buf ""
+                :params {}})))
+
+(defn handshake (conn)
+  "Read backend messages until ReadyForQuery ('Z'), handling auth challenges and
+  recording server parameters along the way."
+  (let (f (read-frame conn)
+        type (get f 0)
+        body (get f 1)
+        conn (get f 2))
+    (cond
+      (= type "R") (handle-auth conn body)
+      (= type "S") (handshake (record-param conn body))
+      (= type "K") (handshake conn)   ; BackendKeyData — for cancellation; ignore here
+      (= type "N") (handshake conn)   ; NoticeResponse
+      (= type "Z") conn               ; ReadyForQuery — handshake complete
+      (= type "E") (throw (str "store: " (error-text body)))
+      else (handshake conn))))
+
+;; ---- authentication ---------------------------------------------------------
+
+(defn handle-auth (conn body)
+  "Dispatch on the Authentication sub-type (Int32 at the head of an 'R' message)."
+  (let (subtype (read-int32 body 0))
+    (cond
+      (= subtype 0) (handshake conn)                 ; AuthenticationOk
+      (= subtype 3) (send-password conn)             ; CleartextPassword
+      (= subtype 5) (send-md5 conn (substring body 4 8))
+      (= subtype 10) (scram-begin conn)              ; SASL — we offer SCRAM-SHA-256
+      (= subtype 11) (scram-continue conn body)      ; SASLContinue (server-first)
+      (= subtype 12) (scram-finish conn body)        ; SASLFinal (server signature)
+      else (throw (str "store: unsupported auth method " subtype)))))
+
+(defn send-password (conn)
+  (tcp-send (get conn :sock) (password-message (get conn :password)))
+  (handshake conn))
+
+(defn send-md5 (conn salt)
+  "MD5: 'md5' ++ md5hex( md5hex(password ++ user) ++ salt-bytes )."
+  (let (inner (md5 (str (get conn :password) (get conn :user)))
+        outer (md5-bytes (into [] (concat (string->utf8-bytes inner)
+                                    (bytestr->bytes salt)))))
+    (tcp-send (get conn :sock) (password-message (str "md5" outer)))
+    (handshake conn)))
+
+(defn scram-begin (conn)
+  (let (nonce (gen-nonce)
+        st (scram/start (get conn :user) (get conn :password) nonce))
+    (tcp-send (get conn :sock) (sasl-initial "SCRAM-SHA-256" (get st :first)))
+    (handshake (assoc conn :scram st))))
+
+(defn scram-continue (conn body)
+  (let (server-first (bytestr->utf8 (substring body 4 (string-length body)))
+        st (scram/continue (get conn :scram) server-first))
+    (tcp-send (get conn :sock) (sasl-response (get st :final)))
+    (handshake (assoc conn :scram st))))
+
+(defn scram-finish (conn body)
+  (let (server-final (bytestr->utf8 (substring body 4 (string-length body))))
+    (if (= (scram/finish (get conn :scram) server-final) :ok)
+      (handshake conn)
+      (throw "store: SCRAM server verification failed"))))
+
+(defn gen-nonce ()
+  "A fresh client nonce: hex of 18 random bytes (alphanumeric — no SCRAM separators)."
+  (bytes->hex (random-bytes 18)))
+
+;; ---- queries ----------------------------------------------------------------
+
+(defn query (conn sql)
+  "Run `sql` via the simple query protocol (no parameters). Returns `[result conn']`
+  where `result` is `{:columns [name …] :rows [[value …] …]}` with values decoded to
+  Brood types and NULL → nil."
+  (tcp-send (get conn :sock) (query-message sql))
+  (collect conn {:columns [] :rows []} []))
+
+(defn exec (conn sql params)
+  "Run `sql` with bound `params` via the extended protocol — `$1`, `$2`, … are filled
+  from `params` (server-side, so values are never interpolated into SQL). One-shot:
+  parses an unnamed statement, binds, describes the portal (to learn result types),
+  executes, and syncs. Returns `[result conn']` like `query`."
+  (tcp-send (get conn :sock)
+    (str (parse-message "" sql)
+      (bind-message "" "" params)
+      (describe-message "P" "")
+      (execute-message "" 0)
+      (sync-message)))
+  (collect conn {:columns [] :rows []} []))
+
+(defn collect (conn acc cols)
+  "Drive the result stream until ReadyForQuery, decoding each DataRow with the column
+  types from the preceding RowDescription. `cols` is the current column descriptor
+  list (`[{:name :type-oid} …]`)."
+  (let (f (read-frame conn)
+        type (get f 0)
+        body (get f 1)
+        conn (get f 2))
+    (cond
+      (= type "T") (collect conn acc (parse-row-description body))
+      (= type "D") (collect conn (add-row acc cols body) cols)
+      (= type "C") (collect conn acc cols)       ; CommandComplete
+      (= type "Z") [(finalize acc cols) conn]    ; ReadyForQuery — done
+      (= type "E") (throw (str "store: " (error-text body)))
+      (= type "1") (collect conn acc cols)       ; ParseComplete
+      (= type "2") (collect conn acc cols)       ; BindComplete
+      (= type "3") (collect conn acc cols)       ; CloseComplete
+      (= type "t") (collect conn acc cols)       ; ParameterDescription
+      (= type "n") (collect conn acc cols)       ; NoData
+      (= type "s") (collect conn acc cols)       ; PortalSuspended
+      (= type "N") (collect conn acc cols)       ; NoticeResponse
+      (= type "S") (collect conn acc cols)       ; ParameterStatus mid-stream
+      else (collect conn acc cols))))
+
+(defn finalize (acc cols)
+  "Project the column descriptors down to names for the public result."
+  (assoc acc :columns (into [] (map (fn (c) (get c :name)) cols))))
+
+(defn add-row (acc cols body)
+  (assoc acc :rows (into (get acc :rows) [(decode-row body cols)])))
+
+;; ---- frame reassembly -------------------------------------------------------
+
+(defn read-frame (conn)
+  "Pull one complete backend message. Returns `[type body conn']` where `type` is
+  the 1-char message type, `body` the message body (length field stripped), and
+  `conn'` the conn with the consumed bytes removed from its buffer."
+  (let (conn (fill-to conn 5)
+        buf (get conn :buf)
+        type (substring buf 0 1)
+        total (+ 1 (read-int32 buf 1))
+        conn (fill-to conn total)
+        buf (get conn :buf))
+    [type
+     (substring buf 5 total)
+     (assoc conn :buf (substring buf total (string-length buf)))]))
+
+(defn fill-to (conn n)
+  "Ensure the conn's buffer holds at least `n` bytes, blocking on the mailbox for
+  more socket chunks as needed."
+  (if (>= (string-length (get conn :buf)) n)
+    conn
+    (let (sock (get conn :sock)
+          more (receive
+                 ([:tcp ~sock d] d)
+                 ([:tcp-closed ~sock] (throw "store: connection closed by server"))
+                 (after 15000 (throw "store: timed out waiting for server"))))
+      (fill-to (assoc conn :buf (str (get conn :buf) more)) n))))
+
+;; ---- backend message decoders -----------------------------------------------
+
+(defn record-param (conn body)
+  "ParameterStatus ('S'): name CString, value CString → record in conn :params."
+  (let (r1 (read-cstring body 0)
+        r2 (read-cstring body (get r1 1)))
+    (assoc conn :params (assoc (get conn :params) (get r1 0) (get r2 0)))))
+
+(defn parse-row-description (body)
+  "RowDescription ('T'): Int16 field count, then per field a name CString followed by
+  18 bytes of metadata. We keep the name and the type OID (at offset name-end + 6),
+  returning `[{:name :type-oid} …]`."
+  (rd-fields body 2 (read-int16 body 0) []))
+
+(defn rd-fields (body off n acc)
+  (if (= n 0)
+    acc
+    (let (r (read-cstring body off)
+          name-end (get r 1))
+      (rd-fields body (+ name-end 18) (- n 1)
+        (into acc [{:name (get r 0)
+                    :type-oid (read-int32 body (+ name-end 6))}])))))
+
+(defn decode-row (body cols)
+  "DataRow ('D'): Int16 column count, then per column an Int32 length (-1 = NULL) and
+  that many text bytes — decoded to a Brood value via the column's type OID."
+  (dr-cols body 2 (read-int16 body 0) cols 0 []))
+
+(defn dr-cols (body off n cols idx acc)
+  (if (= idx n)
+    acc
+    (let (len (read-int32 body off))
+      (if (= len 4294967295)    ; -1 as unsigned → NULL
+        (dr-cols body (+ off 4) n cols (+ idx 1) (into acc [nil]))
+        (let (oid (get (get cols idx) :type-oid)
+              text (bytestr->utf8 (substring body (+ off 4) (+ off 4 len))))
+          (dr-cols body (+ off 4 len) n cols (+ idx 1)
+            (into acc [(types/decode-value oid text)])))))))
+
+(defn error-text (body)
+  "ErrorResponse ('E'): a series of (type byte, value CString) ended by a zero byte.
+  Render the severity, message, and SQLSTATE."
+  (let (fields (error-fields body 0 {}))
+    (str (get fields "S" "ERROR") ": " (get fields "M" "(no message)")
+      (if (get fields "C") (str " [" (get fields "C") "]") ""))))
+
+(defn error-fields (body off acc)
+  (if (= (byte-at body off) 0)
+    acc
+    (let (code (substring body off (+ off 1))
+          r (read-cstring body (+ off 1)))
+      (error-fields body (get r 1) (assoc acc code (get r 0))))))
+
+;; ---- teardown ---------------------------------------------------------------
+
+(defn close (conn)
+  "Send Terminate and close the socket."
+  (tcp-send (get conn :sock) (terminate-message))
+  (tcp-close (get conn :sock)))
