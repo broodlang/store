@@ -95,7 +95,7 @@
             drops (if (get o :drop)
                     (map (fn (c) (schema/drop-column-sql table c)) (get d :drop))
                     [])
-            stmts (concat adds drops))
+            stmts (append adds drops))
         (reduce (fn (_ s) (exec repo s [])) nil stmts)
         stmts))))
 
