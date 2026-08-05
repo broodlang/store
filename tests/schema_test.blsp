@@ -12,6 +12,6 @@
     (is (= (column-type :text) "text"))
     (is (= (column-type :decimal) "numeric"))
     (is (= (column-type :boolean) "boolean"))
-    (is (= (column-type :uuid) "uuid")))   ; unknown type → emitted verbatim
+    (is (= (column-type :uuid) "uuid"))) ; unknown type → emitted verbatim
   (test "drop-table-sql"
     (is (= (drop-table-sql {:table :users}) "DROP TABLE IF EXISTS users"))))

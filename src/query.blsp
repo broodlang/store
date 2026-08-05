@@ -69,28 +69,32 @@
     (cond
       (get *cmp-ops* op)
         [(str (ident (second expr)) " " (get *cmp-ops* op) " " (placeholder params))
-         (into params [(nth expr 2)])]
+          (into params [(nth expr 2)])]
       (= op :and) (compile-junction "AND" (rest expr) params)
       (= op :or) (compile-junction "OR" (rest expr) params)
-      (= op :not) (let (r (compile-expr (second expr) params))
-                    [(str "NOT (" (get r 0) ")") (get r 1)])
+      (= op :not)
+        (let (r (compile-expr (second expr) params))
+          [(str "NOT (" (get r 0) ")") (get r 1)])
       (= op :in) (compile-in (second expr) (nth expr 2) params)
-      (= op :like) [(str (ident (second expr)) " LIKE " (placeholder params))
-                    (into params [(nth expr 2)])]
-      (= op :ilike) [(str (ident (second expr)) " ILIKE " (placeholder params))
-                     (into params [(nth expr 2)])]
+      (= op :like)
+        [(str (ident (second expr)) " LIKE " (placeholder params))
+          (into params [(nth expr 2)])]
+      (= op :ilike)
+        [(str (ident (second expr)) " ILIKE " (placeholder params))
+          (into params [(nth expr 2)])]
       (= op :is-nil) [(str (ident (second expr)) " IS NULL") params]
       (= op :not-nil) [(str (ident (second expr)) " IS NOT NULL") params]
       else (throw (str "query: unknown operator " (pr-str op))))))
 
 (defn compile-junction (sep exprs params)
-  (compile-junction--acc sep exprs params []))
+  (compile-junction-acc sep exprs params []))
 
-(defn compile-junction--acc (sep exprs params sqls)
+(defn- compile-junction-acc
+  (sep exprs params sqls)
   (if (empty? exprs)
     [(str "(" (join (str " " sep " ") sqls) ")") params]
     (let (r (compile-expr (first exprs) params))
-      (compile-junction--acc sep (rest exprs) (get r 1) (into sqls [(get r 0)])))))
+      (compile-junction-acc sep (rest exprs) (get r 1) (into sqls [(get r 0)])))))
 
 (defn compile-in (col vals params)
   (let (start (count params)
@@ -143,18 +147,19 @@
         colnames (join ", " (map ident cols))
         phs (join ", " (map (fn (i) (str "$" (inc i))) (range (count cols)))))
     [(str "INSERT INTO " (ident table) " (" colnames ") VALUES (" phs ") RETURNING *")
-     params]))
+      params]))
 
 (defn update-sql (table changes where-expr)
   "`changes` is a `{:col new-value …}` map → UPDATE … SET … WHERE … RETURNING *.
   The SET values are `$1…$k`; the WHERE placeholders continue from `$k+1`."
   (let (cols (keys changes)
         set-vals (into [] (map (fn (k) (get changes k)) cols))
-        set-sql (join ", " (map (fn (i) (str (ident (nth cols i)) " = $" (inc i)))
-                             (range (count cols))))
+        set-sql (join ", "
+                  (map (fn (i) (str (ident (nth cols i)) " = $" (inc i)))
+                    (range (count cols))))
         wr (compile-expr where-expr set-vals))
     [(str "UPDATE " (ident table) " SET " set-sql " WHERE " (get wr 0) " RETURNING *")
-     (get wr 1)]))
+      (get wr 1)]))
 
 (defn delete-sql (table where-expr)
   "DELETE FROM table WHERE … RETURNING *."

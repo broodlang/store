@@ -13,7 +13,7 @@
                      (order-by :name)
                      (limit 10)))
           ["SELECT id, name FROM users WHERE email = $1 ORDER BY name ASC LIMIT $2"
-           ["a@b.c" 10]])))
+            ["a@b.c" 10]])))
   (test "repeated where conjoins with AND"
     (is (= (to-sql (-> (from :u) (where [:> :age 18]) (where [:< :age 65])))
           ["SELECT * FROM u WHERE (age > $1 AND age < $2)" [18 65]])))

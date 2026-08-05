@@ -66,7 +66,8 @@
   "The live column names (keywords) of `table`, via the adaptor's introspection.
   Empty when the table doesn't exist."
   (map (fn (c) (keyword (get c :name)))
-    ((get (get repo :adaptor) :columns) (get repo :pool) (name (if (map? table) (get table :table) table)))))
+    ((get (get repo :adaptor) :columns) (get repo :pool)
+      (name (if (map? table) (get table :table) table)))))
 
 (defn diff (repo schema-map)
   "Compare `schema-map`'s :fields to the live table; return the migration as data:
@@ -115,30 +116,36 @@
   vector of specs `[:posts :author]`, or a map `{assoc → nested-spec}` for nested
   preloads, e.g. `{:posts :comments}` or `{:posts [:comments :author]}`."
   (cond
-    (keyword? spec) (preload--one repo schema rows spec nil)
-    (map? spec) (reduce (fn (rs k) (preload--one repo schema rs k (get spec k))) rows (keys spec))
+    (keyword? spec) (preload-one repo schema rows spec nil)
+    (map? spec) (reduce (fn (rs k) (preload-one repo schema rs k (get spec k))) rows (keys spec))
     (vector? spec) (reduce (fn (rs s) (preload repo schema rs s)) rows spec)
     else (throw (str "preload: bad spec " (pr-str spec)))))
 
-(defn preload--one (repo schema rows akey nested)
+(defn- preload-one
+  (repo schema rows akey nested)
   (let (rel (get (get schema :associations) akey))
     (if (nil? rel)
       (throw (str "preload: schema has no association " (pr-str akey)))
-      (let (loaded (preload--attach repo schema rows akey rel))
-        (if (nil? nested) loaded (preload--nest repo loaded akey rel nested))))))
+      (let (loaded (preload-attach repo schema rows akey rel))
+        (if (nil? nested) loaded (preload-nest repo loaded akey rel nested))))))
 
-(defn preload--attach (repo schema rows akey rel)
+(defn- preload-attach
+  (repo schema rows akey rel)
   "Run one association's query and attach it under `akey` (no nesting)."
   (cond
-    (= (get rel :type) :has-many) (preload--children repo rows akey rel (get schema :primary-key) false)
-    (= (get rel :type) :has-one) (preload--children repo rows akey rel (get schema :primary-key) true)
-    (= (get rel :type) :belongs-to) (preload--belongs-to repo rows akey rel)
-    (= (get rel :type) :many-to-many) (preload--many-to-many repo rows akey rel (get schema :primary-key))
+    (= (get rel :type) :has-many)
+      (preload-children repo rows akey rel (get schema :primary-key) false)
+    (= (get rel :type) :has-one)
+      (preload-children repo rows akey rel (get schema :primary-key) true)
+    (= (get rel :type) :belongs-to) (preload-belongs-to repo rows akey rel)
+    (= (get rel :type) :many-to-many)
+      (preload-many-to-many repo rows akey rel (get schema :primary-key))
     else (throw (str "preload: unknown association type " (pr-str (get rel :type))))))
 
 ;; has-many / has-one: child.fk references the parent's key. `one?` attaches the
 ;; first child instead of the list.
-(defn preload--children (repo rows akey rel parent-key one?)
+(defn- preload-children
+  (repo rows akey rel parent-key one?)
   (let (ref (or (get rel :references) parent-key)
         fk (get rel :fk)
         ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r ref)) rows)))
@@ -152,7 +159,8 @@
       rows)))
 
 ;; belongs-to: this row's fk references the target's key; attach the single match.
-(defn preload--belongs-to (repo rows akey rel)
+(defn- preload-belongs-to
+  (repo rows akey rel)
   (let (fk (get rel :fk)
         ref (or (get rel :references) :id)
         ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r fk)) rows)))
@@ -164,9 +172,11 @@
 
 ;; many-to-many: parent → join-table → target. Two queries: the join rows for the
 ;; parents' keys, then the targets for the join's target keys.
-(defn preload--many-to-many (repo rows akey rel parent-key)
+(defn- preload-many-to-many
+  (repo rows akey rel parent-key)
   (let (jk (get rel :join-keys)
-        pfk (first jk) tfk (second jk)
+        pfk (first jk)
+        tfk (second jk)
         tref (or (get rel :references) :id)
         pkeys (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r parent-key)) rows)))
         joins (if (empty? pkeys)
@@ -186,7 +196,8 @@
 ;; Nested preload: recurse `nested` onto the just-loaded associated rows, using the
 ;; association's `:schema`, then re-attach by primary key (collect → preload → index
 ;; → redistribute, so it stays one query per level).
-(defn preload--nest (repo loaded akey rel nested)
+(defn- preload-nest
+  (repo loaded akey rel nested)
   (let (child-schema (resolve-schema (get rel :schema) akey)
         child-pk (get child-schema :primary-key)
         many? (not (= (get rel :type) :belongs-to))
@@ -196,16 +207,19 @@
         done (preload repo child-schema kids nested)
         idx (reduce (fn (m c) (assoc m (get c child-pk) c)) {} done))
     (map (fn (r)
-           (assoc r akey
-             (if many?
-               (map (fn (c) (get idx (get c child-pk))) (get r akey))
-               (let (c (get r akey)) (if (nil? c) nil (get idx (get c child-pk)))))))
+           (assoc r
+             akey
+               (if many?
+                 (map (fn (c) (get idx (get c child-pk))) (get r akey))
+                 (let (c (get r akey)) (if (nil? c) nil (get idx (get c child-pk)))))))
       loaded)))
 
 (defn resolve-schema (s akey)
   (cond
-    (nil? s) (throw (str "preload: association " (pr-str akey)
-                      " needs a :schema for a nested preload"))
+    (nil? s)
+      (throw (str "preload: association "
+               (pr-str akey)
+               " needs a :schema for a nested preload"))
     (fn? s) (s)
     else s))
 
@@ -217,8 +231,7 @@
   `delete`/`exec` on it. Commits if `f` returns; rolls back and re-raises if `f`
   throws. Returns `f`'s value. (Adaptor-dependent: store-postgres is fully
   transactional; an adaptor that can't support it raises.)"
-  ((get (get repo :adaptor) :transaction)
-   (get repo :pool)
-   (fn (tx-exec)
-     (f {:adaptor {:exec (fn (_ sql params) (tx-exec sql params))}
-         :pool nil}))))
+  ((get (get repo :adaptor) :transaction) (get repo :pool)
+    (fn (tx-exec)
+      (f {:adaptor {:exec (fn (_ sql params) (tx-exec sql params))}
+          :pool nil}))))
