@@ -25,9 +25,11 @@
   actually present in params (so a partial update touches only what was sent). This
   is the allowlist that stops mass-assignment."
   (let (params (get cs :params))
-    (assoc cs :changes
-      (reduce (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))
-        (get cs :changes) fields))))
+    (assoc cs
+      :changes
+        (reduce (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))
+          (get cs :changes)
+          fields))))
 
 (defn put-change (cs field value)
   "Force a change programmatically (e.g. a derived/defaulted field)."

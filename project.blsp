@@ -8,5 +8,6 @@
 (project
   :name "store"
   :version "0.1.1"
-  :description "An adaptor-agnostic database storage library for Brood (Ecto-like): queries as plain data, schema, changeset, and a repo over a swappable driver."
+  :description
+    "An adaptor-agnostic database storage library for Brood (Ecto-like): queries as plain data, schema, changeset, and a repo over a swappable driver."
   :repository "https://github.com/broodlang/store")
