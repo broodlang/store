@@ -152,7 +152,7 @@
         kids (if (empty? ids)
                []
                (all repo (-> (query/from (get rel :table)) (query/where [:in fk ids]))))
-        grouped (group-by (fn (c) (get c fk)) kids))
+        grouped (enum/group-by (fn (c) (get c fk)) kids))
     (map (fn (r)
            (let (g (or (get grouped (get r ref)) []))
              (assoc r akey (if one? (first g) g))))
@@ -187,7 +187,7 @@
                   []
                   (all repo (-> (query/from (get rel :table)) (query/where [:in tref tids]))))
         tindex (reduce (fn (m t) (assoc m (get t tref) t)) {} targets)
-        joins-by-parent (group-by (fn (j) (get j pfk)) joins))
+        joins-by-parent (enum/group-by (fn (j) (get j pfk)) joins))
     (map (fn (r)
            (let (js (or (get joins-by-parent (get r parent-key)) []))
              (assoc r akey (map (fn (j) (get tindex (get j tfk))) js))))
