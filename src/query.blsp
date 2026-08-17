@@ -64,27 +64,28 @@
 
 (defn placeholder (params) (str "$" (inc (count params))))
 
-(defn compile-expr (expr params)
-  (let (op (first expr))
-    (cond
-      (get *cmp-ops* op)
-        [(str (ident (second expr)) " " (get *cmp-ops* op) " " (placeholder params))
-          (into params [(nth expr 2)])]
-      (= op :and) (compile-junction "AND" (rest expr) params)
-      (= op :or) (compile-junction "OR" (rest expr) params)
-      (= op :not)
-        (let (r (compile-expr (second expr) params))
-          [(str "NOT (" (get r 0) ")") (get r 1)])
-      (= op :in) (compile-in (second expr) (nth expr 2) params)
-      (= op :like)
-        [(str (ident (second expr)) " LIKE " (placeholder params))
-          (into params [(nth expr 2)])]
-      (= op :ilike)
-        [(str (ident (second expr)) " ILIKE " (placeholder params))
-          (into params [(nth expr 2)])]
-      (= op :is-nil) [(str (ident (second expr)) " IS NULL") params]
-      (= op :not-nil) [(str (ident (second expr)) " IS NOT NULL") params]
-      else (throw (str "query: unknown operator " (pr-str op))))))
+(check-allow :non-tail-recursion
+  (defn compile-expr (expr params)
+    (let (op (first expr))
+      (cond
+        (get *cmp-ops* op)
+          [(str (ident (second expr)) " " (get *cmp-ops* op) " " (placeholder params))
+            (into params [(nth expr 2)])]
+        (= op :and) (compile-junction "AND" (rest expr) params)
+        (= op :or) (compile-junction "OR" (rest expr) params)
+        (= op :not)
+          (let (r (compile-expr (second expr) params))
+            [(str "NOT (" (get r 0) ")") (get r 1)])
+        (= op :in) (compile-in (second expr) (nth expr 2) params)
+        (= op :like)
+          [(str (ident (second expr)) " LIKE " (placeholder params))
+            (into params [(nth expr 2)])]
+        (= op :ilike)
+          [(str (ident (second expr)) " ILIKE " (placeholder params))
+            (into params [(nth expr 2)])]
+        (= op :is-nil) [(str (ident (second expr)) " IS NULL") params]
+        (= op :not-nil) [(str (ident (second expr)) " IS NOT NULL") params]
+        else (throw (str "query: unknown operator " (pr-str op)))))))
 
 (defn compile-junction (sep exprs params)
   (compile-junction-acc sep exprs params []))
