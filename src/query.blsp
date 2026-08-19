@@ -93,27 +93,27 @@
 (defn- compile-junction-acc
   (sep exprs params sqls)
   (if (empty? exprs)
-    [(str "(" (join (str " " sep " ") sqls) ")") params]
+    [(str "(" (string/join (str " " sep " ") sqls) ")") params]
     (let (r (compile-expr (first exprs) params))
       (compile-junction-acc sep (rest exprs) (get r 1) (into sqls [(get r 0)])))))
 
 (defn compile-in (col vals params)
   (let (start (count params)
         phs (map (fn (i) (str "$" (+ start i 1))) (range (count vals))))
-    [(str (ident col) " IN (" (join ", " phs) ")") (into params (into [] vals))]))
+    [(str (ident col) " IN (" (string/join ", " phs) ")") (into params (into [] vals))]))
 
 ;; ---- clause assembly --------------------------------------------------------
 
 (defn select-cols (q)
   (let (cols (get q :select))
-    (if (or (nil? cols) (empty? cols)) "*" (join ", " (map ident cols)))))
+    (if (or (nil? cols) (empty? cols)) "*" (string/join ", " (map ident cols)))))
 
 (defn order-clause (q)
   (let (ords (get q :order))
     (if (or (nil? ords) (empty? ords))
       ""
       (str " ORDER BY "
-        (join ", "
+        (string/join ", "
           (map (fn (o) (str (ident (first o)) " " (if (= (second o) :desc) "DESC" "ASC"))) ords))))))
 
 (defn limit-offset (q params)
@@ -145,8 +145,8 @@
   "`row` is a `{:col value …}` map → INSERT … VALUES (…) RETURNING *."
   (let (cols (keys row)
         params (into [] (map (fn (k) (get row k)) cols))
-        colnames (join ", " (map ident cols))
-        phs (join ", " (map (fn (i) (str "$" (inc i))) (range (count cols)))))
+        colnames (string/join ", " (map ident cols))
+        phs (string/join ", " (map (fn (i) (str "$" (inc i))) (range (count cols)))))
     [(str "INSERT INTO " (ident table) " (" colnames ") VALUES (" phs ") RETURNING *")
       params]))
 
@@ -155,7 +155,7 @@
   The SET values are `$1…$k`; the WHERE placeholders continue from `$k+1`."
   (let (cols (keys changes)
         set-vals (into [] (map (fn (k) (get changes k)) cols))
-        set-sql (join ", "
+        set-sql (string/join ", "
                   (map (fn (i) (str (ident (nth cols i)) " = $" (inc i)))
                     (range (count cols))))
         wr (compile-expr where-expr set-vals))
