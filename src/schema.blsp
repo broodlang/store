@@ -36,7 +36,7 @@
                (keys fields))
         pk (get s :primary-key)
         pk-sql (if (nil? pk) "" (str ", PRIMARY KEY (" (query/ident pk) ")")))
-    (str "CREATE TABLE " (query/ident (get s :table)) " (" (join ", " cols) pk-sql ")")))
+    (str "CREATE TABLE " (query/ident (get s :table)) " (" (string/join ", " cols) pk-sql ")")))
 
 (defn drop-table-sql (s)
   (str "DROP TABLE IF EXISTS " (query/ident (get s :table))))
