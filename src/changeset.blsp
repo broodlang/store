@@ -4,7 +4,7 @@
   is a plain map threaded through ordinary functions:
 
     (-> (change params)
-        (cast [:name :email :age])         ; pick allowed fields from params
+        (permit [:name :email :age])       ; allowlist the fields to take from params
         (validate-required [:name :email]) ; must be present and non-blank
         (validate :age (fn (a) (>= a 0)) \"must be non-negative\"))
 
@@ -20,7 +20,7 @@
     {:data {} :params (first args) :changes {} :errors [] :valid? true}
     {:data (first args) :params (second args) :changes {} :errors [] :valid? true}))
 
-(defn cast (cs fields)
+(defn permit (cs fields)
   "Copy each of the allowed `fields` from params into changes — but only those
   actually present in params (so a partial update touches only what was sent). This
   is the allowlist that stops mass-assignment."
