@@ -148,7 +148,7 @@
   (repo rows akey rel parent-key one?)
   (let (ref (or (get rel :references) parent-key)
         fk (get rel :fk)
-        ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r ref)) rows)))
+        ids (seq/distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r ref)) rows)))
         kids (if (empty? ids)
                []
                (all repo (-> (query/from (get rel :table)) (query/where [:in fk ids]))))
@@ -163,7 +163,7 @@
   (repo rows akey rel)
   (let (fk (get rel :fk)
         ref (or (get rel :references) :id)
-        ids (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r fk)) rows)))
+        ids (seq/distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r fk)) rows)))
         parents (if (empty? ids)
                   []
                   (all repo (-> (query/from (get rel :table)) (query/where [:in ref ids]))))
@@ -178,11 +178,11 @@
         pfk (first jk)
         tfk (second jk)
         tref (or (get rel :references) :id)
-        pkeys (distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r parent-key)) rows)))
+        pkeys (seq/distinct (filter (fn (x) (not (nil? x))) (map (fn (r) (get r parent-key)) rows)))
         joins (if (empty? pkeys)
                 []
                 (all repo (-> (query/from (get rel :join-table)) (query/where [:in pfk pkeys]))))
-        tids (distinct (filter (fn (x) (not (nil? x))) (map (fn (j) (get j tfk)) joins)))
+        tids (seq/distinct (filter (fn (x) (not (nil? x))) (map (fn (j) (get j tfk)) joins)))
         targets (if (empty? tids)
                   []
                   (all repo (-> (query/from (get rel :table)) (query/where [:in tref tids]))))
