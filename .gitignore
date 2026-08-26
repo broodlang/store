@@ -1,2 +1,5 @@
 _deps/
 .brood_crash_dump
+
+# Startup-image cache — a build artifact, rebuilt on demand
+.brood/
