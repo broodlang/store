@@ -28,7 +28,7 @@ so the library depends on no specific driver — e.g.
 Add it to a project with:
 
 ```bash
-nest add store :version "^0.3.0"
+nest add store :version "^0.4.0"
 ```
 
 ## Publishing
