@@ -54,7 +54,7 @@
 (defn ident (x)
   "A column/table name from a keyword or string. A keyword `:users.id` keeps its
   dotted form (table-qualified); otherwise it's the bare name."
-  (if (keyword? x) (name x) (str x)))
+  (if (keyword? x) (->string x) (str x)))
 
 (def *cmp-ops*
   {:= "=" :<> "<>" :!= "<>" :> ">" :>= ">=" :< "<" :<= "<="})
