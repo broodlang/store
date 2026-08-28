@@ -27,7 +27,7 @@
    :bool "boolean"})
 
 (defn column-type (t)
-  (or (get *type-sql* t) (name t)))
+  (or (get *type-sql* t) (->string t)))
 
 (defn create-table-sql (s)
   "Render `CREATE TABLE` from a schema map."

@@ -67,7 +67,7 @@
   Empty when the table doesn't exist."
   (map (fn (c) (keyword (get c :name)))
     ((get (get repo :adaptor) :columns) (get repo :pool)
-      (name (if (map? table) (get table :table) table)))))
+      (->string (if (map? table) (get table :table) table)))))
 
 (defn diff (repo schema-map)
   "Compare `schema-map`'s :fields to the live table; return the migration as data:
