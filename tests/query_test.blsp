@@ -39,8 +39,7 @@
     (let (base (-> (from :users) (where [:= :active true])))
       (is (= (get base :from) :users))
       ;; extend dynamically like any map
-      (is (= (to-sql (limit base 1))
-            ["SELECT * FROM users WHERE active = $1 LIMIT $2" [true 1]])))))
+      (is (= (to-sql (limit base 1)) ["SELECT * FROM users WHERE active = $1 LIMIT $2" [true 1]])))))
 
 (describe "query: DML"
   (test "insert-sql (single column → deterministic)"
@@ -50,5 +49,4 @@
     (is (= (update-sql :users {:name "x"} [:= :id 5])
           ["UPDATE users SET name = $1 WHERE id = $2 RETURNING *" ["x" 5]])))
   (test "delete-sql"
-    (is (= (delete-sql :users [:= :id 5])
-          ["DELETE FROM users WHERE id = $1 RETURNING *" [5]]))))
+    (is (= (delete-sql :users [:= :id 5]) ["DELETE FROM users WHERE id = $1 RETURNING *" [5]]))))

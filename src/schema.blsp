@@ -32,11 +32,10 @@
 (defn create-table-sql (s)
   "Render `CREATE TABLE` from a schema map."
   (let (fields (get s :fields)
-        cols (map (fn (f) (str (query/ident f) " " (column-type (get fields f))))
-               (keys fields))
+        cols (map (keys fields) (fn (f) (str (query/ident f) " " (column-type (get fields f)))))
         pk (get s :primary-key)
         pk-sql (if (nil? pk) "" (str ", PRIMARY KEY (" (query/ident pk) ")")))
-    (str "CREATE TABLE " (query/ident (get s :table)) " (" (string/join ", " cols) pk-sql ")")))
+    (str "CREATE TABLE " (query/ident (get s :table)) " (" (string/join cols ", ") pk-sql ")")))
 
 (defn drop-table-sql (s)
   (str "DROP TABLE IF EXISTS " (query/ident (get s :table))))
