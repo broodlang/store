@@ -90,31 +90,31 @@
 (defn compile-junction (sep exprs params)
   (compile-junction-acc sep exprs params []))
 
-(defn- compile-junction-acc
-  (sep exprs params sqls)
+(defn- compile-junction-acc (sep exprs params sqls)
   (if (empty? exprs)
-    [(str "(" (string/join (str " " sep " ") sqls) ")") params]
+    [(str "(" (string/join sqls (str " " sep " ")) ")") params]
     (let (r (compile-expr (first exprs) params))
       (compile-junction-acc sep (rest exprs) (get r 1) (into sqls [(get r 0)])))))
 
 (defn compile-in (col vals params)
   (let (start (count params)
-        phs (map (fn (i) (str "$" (+ start i 1))) (range (count vals))))
-    [(str (ident col) " IN (" (string/join ", " phs) ")") (into params (into [] vals))]))
+        phs (map (range (count vals)) (fn (i) (str "$" (+ start i 1)))))
+    [(str (ident col) " IN (" (string/join phs ", ") ")") (into params (into [] vals))]))
 
 ;; ---- clause assembly --------------------------------------------------------
 
 (defn select-cols (q)
   (let (cols (get q :select))
-    (if (or (nil? cols) (empty? cols)) "*" (string/join ", " (map ident cols)))))
+    (if (or (nil? cols) (empty? cols)) "*" (string/join (map cols ident) ", "))))
 
 (defn order-clause (q)
   (let (ords (get q :order))
     (if (or (nil? ords) (empty? ords))
       ""
       (str " ORDER BY "
-        (string/join ", "
-          (map (fn (o) (str (ident (first o)) " " (if (= (second o) :desc) "DESC" "ASC"))) ords))))))
+        (string/join (map ords
+                       (fn (o) (str (ident (first o)) " " (if (= (second o) :desc) "DESC" "ASC"))))
+          ", ")))))
 
 (defn limit-offset (q params)
   "Append LIMIT/OFFSET as params (so values are bound, not interpolated). Returns
@@ -144,9 +144,9 @@
 (defn insert-sql (table row)
   "`row` is a `{:col value …}` map → INSERT … VALUES (…) RETURNING *."
   (let (cols (keys row)
-        params (into [] (map (fn (k) (get row k)) cols))
-        colnames (string/join ", " (map ident cols))
-        phs (string/join ", " (map (fn (i) (str "$" (inc i))) (range (count cols)))))
+        params (into [] (map cols (fn (k) (get row k))))
+        colnames (string/join (map cols ident) ", ")
+        phs (string/join (map (range (count cols)) (fn (i) (str "$" (inc i)))) ", "))
     [(str "INSERT INTO " (ident table) " (" colnames ") VALUES (" phs ") RETURNING *")
       params]))
 
@@ -154,10 +154,10 @@
   "`changes` is a `{:col new-value …}` map → UPDATE … SET … WHERE … RETURNING *.
   The SET values are `$1…$k`; the WHERE placeholders continue from `$k+1`."
   (let (cols (keys changes)
-        set-vals (into [] (map (fn (k) (get changes k)) cols))
-        set-sql (string/join ", "
-                  (map (fn (i) (str (ident (nth cols i)) " = $" (inc i)))
-                    (range (count cols))))
+        set-vals (into [] (map cols (fn (k) (get changes k))))
+        set-sql (string/join (map (range (count cols))
+                               (fn (i) (str (ident (nth cols i)) " = $" (inc i))))
+                  ", ")
         wr (compile-expr where-expr set-vals))
     [(str "UPDATE " (ident table) " SET " set-sql " WHERE " (get wr 0) " RETURNING *")
       (get wr 1)]))

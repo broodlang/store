@@ -27,9 +27,9 @@
   (let (params (get cs :params))
     (assoc cs
       :changes
-        (reduce (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))
+        (reduce fields
           (get cs :changes)
-          fields))))
+          (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))))))
 
 (defn put-change (cs field value)
   "Force a change programmatically (e.g. a derived/defaulted field)."
@@ -43,10 +43,11 @@
 
 (defn validate-required (cs fields)
   "Each of `fields` must be present in changes and non-nil / non-blank."
-  (reduce (fn (c f)
-            (let (v (get (get c :changes) f))
-              (if (or (nil? v) (= v "")) (add-error c f "is required") c)))
-    cs fields))
+  (reduce fields
+    cs
+    (fn (c f)
+      (let (v (get (get c :changes) f))
+        (if (or (nil? v) (= v "")) (add-error c f "is required") c)))))
 
 (defn validate (cs field pred message)
   "If `field` is set in changes and `(pred value)` is false, add `message`."
