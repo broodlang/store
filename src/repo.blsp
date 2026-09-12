@@ -79,8 +79,8 @@
       (let (want (keys (get schema-map :fields))
             have-set (reduce have {} (fn (m c) (assoc m c true)))
             want-set (reduce want {} (fn (m c) (assoc m c true))))
-        {:add (into [] (filter want (fn (f) (nil? (get have-set f)))))
-         :drop (into [] (filter have (fn (c) (nil? (get want-set c)))))}))))
+        {:add (into [] (seq/filter want (fn (f) (nil? (get have-set f)))))
+         :drop (into [] (seq/filter have (fn (c) (nil? (get want-set c)))))}))))
 
 (defn migrate (repo schema-map & opts)
   "Reconcile the live table with `schema-map`. Creates it if absent; otherwise ADDs
@@ -145,7 +145,7 @@
 (defn- preload-children (repo rows akey rel parent-key one?)
   (let (ref (or (get rel :references) parent-key)
         fk (get rel :fk)
-        ids (seq/distinct (filter (map rows (fn (r) (get r ref))) (fn (x) (not (nil? x)))))
+        ids (seq/distinct (seq/filter (map rows (fn (r) (get r ref))) (fn (x) (not (nil? x)))))
         kids (if (empty? ids)
                []
                (all repo (-> (query/from (get rel :table)) (query/where [:in fk ids]))))
@@ -159,7 +159,7 @@
 (defn- preload-belongs-to (repo rows akey rel)
   (let (fk (get rel :fk)
         ref (or (get rel :references) :id)
-        ids (seq/distinct (filter (map rows (fn (r) (get r fk))) (fn (x) (not (nil? x)))))
+        ids (seq/distinct (seq/filter (map rows (fn (r) (get r fk))) (fn (x) (not (nil? x)))))
         parents (if (empty? ids)
                   []
                   (all repo (-> (query/from (get rel :table)) (query/where [:in ref ids]))))
@@ -173,11 +173,12 @@
         pfk (first jk)
         tfk (second jk)
         tref (or (get rel :references) :id)
-        pkeys (seq/distinct (filter (map rows (fn (r) (get r parent-key))) (fn (x) (not (nil? x)))))
+        pkeys (seq/distinct (seq/filter (map rows (fn (r) (get r parent-key)))
+                              (fn (x) (not (nil? x)))))
         joins (if (empty? pkeys)
                 []
                 (all repo (-> (query/from (get rel :join-table)) (query/where [:in pfk pkeys]))))
-        tids (seq/distinct (filter (map joins (fn (j) (get j tfk))) (fn (x) (not (nil? x)))))
+        tids (seq/distinct (seq/filter (map joins (fn (j) (get j tfk))) (fn (x) (not (nil? x)))))
         targets (if (empty? tids)
                   []
                   (all repo (-> (query/from (get rel :table)) (query/where [:in tref tids]))))
@@ -197,7 +198,7 @@
         many? (not (= (get rel :type) :belongs-to))
         kids (if many?
                (reduce loaded [] (fn (acc r) (into acc (get r akey))))
-               (filter (map loaded (fn (r) (get r akey))) (fn (x) (not (nil? x)))))
+               (seq/filter (map loaded (fn (r) (get r akey))) (fn (x) (not (nil? x)))))
         done (preload repo child-schema kids nested)
         idx (reduce done {} (fn (m c) (assoc m (get c child-pk) c))))
     (map loaded
