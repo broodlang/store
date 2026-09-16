@@ -7,7 +7,7 @@
 ;; so the library has no dependency on any specific database driver.
 (project
   :name "store"
-  :version "0.4.4"
+  :version "0.4.5"
   :brood ">= 0.29.0"
   :description
     "An adaptor-agnostic database storage library for Brood (Ecto-like): queries as plain data, schema, changeset, and a repo over a swappable driver."

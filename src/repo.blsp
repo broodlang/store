@@ -6,6 +6,9 @@
   so this library stays database-agnostic. `all`/`one` take a query map (see `query`)
   and return rows as plain maps keyed by column name."
   (:alias query)
+  (:alias telemetry)
+  (:alias seq)
+  (:alias string)
   (:alias schema))
 
 (defn open (adaptor opts)
@@ -18,11 +21,71 @@
   ((get (get repo :adaptor) :stop-pool) (get repo :pool)))
 
 ;; ---- running queries --------------------------------------------------------
+;;
+;; Every query the repo runs — `all`, `one`, the writes, migrations, the transaction's
+;; inner repo — passes through `exec`, which makes it the one place to say that a query
+;; happened. It emits `[:store :query :stop]` (measurements `{:duration ms}`, metadata
+;; `{:sql :op :source :params :rows}`) after each one and `[:store :query :exception]`
+;; (`{:sql :op :source :params :error}`) when the adaptor raised, the way Ecto's repo
+;; emits `[:repo :query]`: a fire-and-forget send, nothing when telemetry is not started,
+;; and never a change to what the caller gets back. `:op` and `:source` are read off the
+;; SQL so a metric can be keyed on a bounded pair (`SELECT packages`) instead of the
+;; statement; `:params` is a count, the values are the data.
+
+(def- shape-keywords ["FROM" "INTO" "UPDATE" "TABLE" "JOIN"])
+
+;; `CREATE TABLE IF NOT EXISTS t`, `DROP TABLE IF EXISTS t`, `UPDATE ONLY t`
+(def- shape-qualifiers ["IF" "NOT" "EXISTS" "ONLY"])
+
+(defn- shape-name (ws)
+  "The first word of `ws` that is not a qualifier, with a trailing column list or `;`
+  stripped — `INSERT INTO t (a, b)` / `FROM t;` — or nil."
+  (cond
+    (empty? ws) nil
+    (includes? shape-qualifiers (string/upper (first ws))) (shape-name (rest ws))
+    :else
+      (let (name (first (string/split (first (string/split (first ws) "(")) ";")))
+        (if (= name "") nil name))))
+
+(defn statement-shape (sql)
+  "The statement kind and the table it names, from the SQL: `{:op \"SELECT\" :source
+  \"packages\"}`. The op is the first word, upper-cased; the source is the word after
+  `FROM`, `INTO`, `UPDATE`, `TABLE` or `JOIN` — whichever comes first, skipping `IF NOT
+  EXISTS` and the like — or nil when the statement names none (`SELECT 1`)."
+  (let (words (seq/filter (string/split (string/trim sql) " ") (fn (w) (not (= w ""))))
+        op (string/upper (or (first words) ""))
+        source (letrec (after (fn (ws)
+                                (cond
+                                  (empty? ws) nil
+                                  (includes? shape-keywords (string/upper (first ws)))
+                                    (shape-name (rest ws))
+                                  :else (after (rest ws)))))
+                 (after words)))
+    {:op op :source source}))
+
+(defn- query-metadata (sql params)
+  (assoc (statement-shape sql) :sql sql :params (count params)))
+
+(defn- elapsed-ms (started-ns)
+  (/ (- (os/now-ns) started-ns) 1000000.0))
 
 (defn exec (repo sql params)
   "Run raw parameterized SQL (`$1`, `$2`, …) — the escape hatch. Returns the rows
-  as maps keyed by column name (keywords); the adaptor handles the DB specifics."
-  ((get (get repo :adaptor) :exec) (get repo :pool) sql params))
+  as maps keyed by column name (keywords); the adaptor handles the DB specifics.
+  Emits the `[:store :query …]` telemetry events (see above)."
+  (let (started (os/now-ns)
+        metadata (query-metadata sql params))
+    (try
+      (let (rows ((get (get repo :adaptor) :exec) (get repo :pool) sql params))
+        (telemetry/emit [:store :query :stop]
+          {:duration (elapsed-ms started)}
+          (assoc metadata :rows (count rows)))
+        rows)
+      (catch e
+        (telemetry/emit [:store :query :exception]
+          {:duration (elapsed-ms started)}
+          (assoc metadata :error (error-message e)))
+        (throw e)))))
 
 (defn all (repo q)
   "Run query `q` and return its rows as maps keyed by column name (keywords)."

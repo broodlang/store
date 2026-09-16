@@ -1,0 +1,77 @@
+;; The repo over a fake adaptor: what `exec` emits, and that a raising adaptor still
+;; raises. The adaptor is a map of functions, so no database is involved.
+(defmodule repo-test
+  (:use test)
+  (:alias repo)
+  (:alias telemetry))
+
+(defn- fake-adaptor (rows)
+  {:start-pool (fn (_) :pool)
+   :stop-pool (fn (_) nil)
+   :exec (fn (_ sql _) (if (= sql "BOOM") (error "pg/exec: relation missing") rows))})
+
+(defn- collect (me)
+  "Forward every store event to `me` and drain them after a sync."
+  (telemetry/forward :repo-test-stop [:store :query :stop] me)
+  (telemetry/forward :repo-test-exception [:store :query :exception] me)
+  nil)
+
+(defn- drain (acc)
+  (receive ([:telemetry event m md] (drain (cons [event m md] acc))) (after 200 (reverse acc))))
+
+(describe "statement-shape"
+  (test "select from"
+    (assert= {:op "SELECT" :source "packages"}
+      (repo/statement-shape "SELECT * FROM packages WHERE id = $1")))
+  (test "insert into strips the column list"
+    (assert= {:op "INSERT" :source "releases"}
+      (repo/statement-shape "INSERT INTO releases (a, b) VALUES ($1, $2)")))
+  (test "insert into with no space before the columns"
+    (assert= "releases" (get (repo/statement-shape "insert into releases(a) values ($1)") :source)))
+  (test "update"
+    (assert= {:op "UPDATE" :source "users"} (repo/statement-shape "UPDATE users SET x = 1")))
+  (test "delete from"
+    (assert= {:op "DELETE" :source "docs"} (repo/statement-shape "DELETE FROM docs;")))
+  (test "create table"
+    (assert= {:op "CREATE" :source "packages"}
+      (repo/statement-shape "CREATE TABLE IF NOT EXISTS packages (id int)")))
+  (test "no table" (assert= {:op "SELECT" :source nil} (repo/statement-shape "SELECT 1")))
+  (test "empty" (assert= {:op "" :source nil} (repo/statement-shape "  "))))
+
+(describe "exec emits"
+  :isolated (test "a stop event with the shape, the row count and a duration"
+    (let (me (self)
+          r (repo/open (fake-adaptor [{:id 1} {:id 2}]) {}))
+      (when (nil? (telemetry/pid)) (telemetry/start))
+      (collect me)
+      (assert= [{:id 1} {:id 2}] (repo/exec r "SELECT * FROM packages" [1]))
+      (telemetry/sync)
+      (let ([event m md] (first (drain ())))
+        (assert= [:store :query :stop] event)
+        (is (float? (get m :duration)))
+        (assert= "SELECT" (get md :op))
+        (assert= "packages" (get md :source))
+        (assert= "SELECT * FROM packages" (get md :sql))
+        (assert= 1 (get md :params))
+        (assert= 2 (get md :rows)))
+      (telemetry/detach :repo-test-stop)
+      (telemetry/detach :repo-test-exception)))
+
+  (test "an exception event when the adaptor raises, and the raise still reaches the caller"
+    (let (me (self)
+          r (repo/open (fake-adaptor []) {}))
+      (when (nil? (telemetry/pid)) (telemetry/start))
+      (collect me)
+      (let (caught (try (do (repo/exec r "BOOM" []) nil) (catch e (error-message e))))
+        (assert= "pg/exec: relation missing" caught))
+      (telemetry/sync)
+      (let ([event _ md] (first (drain ())))
+        (assert= [:store :query :exception] event)
+        (assert= "pg/exec: relation missing" (get md :error))
+        (assert= "BOOM" (get md :op)))
+      (telemetry/detach :repo-test-stop)
+      (telemetry/detach :repo-test-exception)))
+
+  (test "nothing is emitted and nothing breaks when telemetry is not running"
+    (telemetry/stop)
+    (assert= [] (repo/exec (repo/open (fake-adaptor []) {}) "SELECT 1" []))))
