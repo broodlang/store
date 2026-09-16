@@ -35,6 +35,8 @@
   (test "create table"
     (assert= {:op "CREATE" :source "packages"}
       (repo/statement-shape "CREATE TABLE IF NOT EXISTS packages (id int)")))
+  (test "drop table"
+    (assert= {:op "DROP" :source "packages"} (repo/statement-shape "DROP TABLE IF EXISTS packages")))
   (test "no table" (assert= {:op "SELECT" :source nil} (repo/statement-shape "SELECT 1")))
   (test "empty" (assert= {:op "" :source nil} (repo/statement-shape "  "))))
 
