@@ -25,10 +25,52 @@ so the library depends on no specific driver — e.g.
   (repo/insert my-repo :users {:name "Ada" :email "ada@example.com"}))
 ```
 
+Joins, aggregates, upserts and atomic increments are data too — no SQL strings:
+
+```brood
+(-> (query/from :organisations :o)
+    (query/select [:o.name [:as [:count] :members]])
+    (query/join :members :m [:= :m.organisation_id [:col :o.id]])
+    (query/group-by [:o.name]))
+
+(repo/update my-repo :releases {:downloads [:+ :downloads 1]} [:= :id id] {:returning :none})
+(repo/insert my-repo :counts {:k "x" :n 1}
+  {:on-conflict {:target [:k] :do {:n [:+ :counts.n [:excluded :n]]}}})
+```
+
+**Changesets** cast form params to the schema's types, validate, and turn a database
+constraint into a field error:
+
+```brood
+(let (cs (-> (changeset/cast {} params [:email :age] users-schema)
+             (changeset/validate-required [:email])
+             (changeset/validate-number :age {:greater-than-or-equal-to 0})
+             (changeset/unique-constraint :email {:name "users_email_idx"})))
+  (match (repo/insert-changeset my-repo cs)
+    ([:ok user] …)
+    ([:error cs] (changeset/error-messages cs))))   ; {:email ["has already been taken"]}
+```
+
+**Migrations** are versioned data, applied once under an advisory lock and recorded in
+`schema_migrations`; `migration/check` proves (with no database) that they build the
+app's schemas, and `migration/generate` writes the one that closes a gap:
+
+```brood
+(def all
+  [{:version 20261018090000
+    :name "users"
+    :up [[:create-table :users {:primary-key :id :fields {:id :serial :email [:text {:null false}]}}]
+         [:create-index :users {:columns [:email] :unique true :name "users_email_idx"}]]}])
+
+(migration/migrate my-repo all)          ; → the migrations applied
+(migration/rollback my-repo all)         ; undo the newest (steps reverse themselves)
+(migration/check all [users-schema])     ; → [] when they agree
+```
+
 Add it to a project with:
 
 ```bash
-nest add store :version "^0.4.0"
+nest add store :version "^0.5.0"
 ```
 
 ## Publishing

@@ -1,0 +1,518 @@
+(defmodule migration
+  "Versioned migrations — each schema change written down once, applied once, in order,
+  and recorded in the `schema_migrations` table.
+
+  A migration is data:
+
+    {:version 20261018090000          ; YYYYMMDDHHMMSS — orders them, and is the record
+     :name \"users-handle\"
+     :up [[:add-column :users :handle [:text {:null true}]]
+          [:execute \"UPDATE users SET handle = lower(split_part(email, '@', 1))\"]
+          [:alter-column :users :handle {:null false :from {:null true}}]]}
+
+  An app keeps its migrations as a vector in one module and passes it to `migrate`.
+  The steps:
+
+    [:create-table table {:fields {…} :primary-key k :if-not-exists bool}]
+    [:drop-table table definition?]            ; the definition makes it reversible
+    [:rename-table from to]
+    [:add-column table field spec opts?]       ; opts: :if-not-exists
+    [:drop-column table field spec?]           ; the spec makes it reversible
+    [:rename-column table from to]
+    [:alter-column table field {:type :null :default :using :from {…}}]
+    [:create-index table {:columns :unique :name :where} opts?]  ; :concurrently :if-not-exists
+    [:drop-index table index opts?]            ; index: a name, or the spec (reversible)
+    [:execute up-sql down-sql?]                ; the escape hatch, e.g. a backfill
+    [:run up-fn down-fn?]                      ; (fn (repo) …) — a data migration in code
+
+  Field specs and indexes are the `schema` module's. A migration's `:down` is written
+  out, or derived: every step above reverses itself when it holds what its reverse needs
+  (an `:alter-column` its `:from`, an `:execute` its `down-sql`), and `rollback` refuses a
+  migration that does not.
+
+  **Running.** `migrate` takes a database advisory lock first, so two machines booting
+  together apply each migration once — the second waits, then finds nothing pending. Each
+  migration runs in its own transaction with the row recording it, so a failure leaves
+  neither half; one that must not (`CREATE INDEX CONCURRENTLY`) says `:transaction? false`.
+
+  **Checking.** Because the steps are data, folding them gives the schema they build
+  (`model`) without a database. `check` compares that with the app's schema maps — a CI
+  test that fails when one moved without the other — and `generate` writes the migration
+  that closes the gap, for review."
+  (:alias repo)
+  (:alias schema)
+  (:alias query))
+
+(def *table* :schema_migrations)
+
+;; An arbitrary, fixed key: every process migrating the same database contends for it.
+(def *lock-key* 7316243105972364)
+
+;; ---- validation -----------------------------------------------------------------
+
+(def- step-ops
+  #{:create-table
+    :drop-table :rename-table :add-column :drop-column :rename-column :alter-column
+    :create-index :drop-index :execute :run})
+
+(defn- concurrent? (step)
+  (and (or (= (first step) :create-index) (= (first step) :drop-index))
+    (get (nth step 3 {}) :concurrently)))
+
+(defn validate (migrations)
+  "Raise on a malformed migration list — a missing or repeated version, an unknown step,
+  a concurrent index inside a transaction — so a typo fails at boot, not halfway through a
+  deploy. Returns the migrations sorted by version."
+  (let (sorted (sort-by migrations (fn (m) (get m :version))))
+    (fold sorted
+      nil
+      (fn (previous m)
+        (let (version (get m :version))
+          (when (not (int? version))
+            (error "migration: " (pr-str (get m :name)) " needs an integer :version"))
+          (when (= version previous) (error "migration: version " version " appears twice"))
+          (when (not (vector? (get m :up))) (error "migration: " version " needs an :up vector"))
+          (doseq (step (append (get m :up) (or (get m :down) [])))
+            (when (not (and (vector? step) (contains? step-ops (first step))))
+              (error "migration: " version " has an unknown step " (pr-str step)))
+            (when (and (concurrent? step) (not (= (get m :transaction?) false)))
+              (error "migration: "
+                version " builds an index CONCURRENTLY, which cannot run in a "
+                "transaction — give it :transaction? false")))
+          version)))
+    sorted))
+
+;; ---- steps → SQL ------------------------------------------------------------------
+
+(defn step-sql (step)
+  "The SQL statements `step` runs (a `:run` step runs code and has none)."
+  (let (op (first step)
+        args (into [] (rest step)))
+    (case op
+      :create-table
+        (let (table (nth args 0 nil) definition (nth args 1 nil))
+          [(schema/create-table-sql (assoc definition :table table)
+             {:if-not-exists (get definition :if-not-exists)})])
+      :drop-table [(schema/drop-table-sql (first args))]
+      :rename-table [(schema/rename-table-sql (first args) (second args))]
+      :add-column
+        (let (table (nth args 0 nil)
+              field (nth args 1 nil)
+              spec (nth args 2 nil)
+              opts (nth args 3 nil))
+          [(schema/add-column-sql table field spec (or opts {}))])
+      :drop-column [(schema/drop-column-sql (first args) (second args))]
+      :rename-column
+        (let (table (nth args 0 nil) from (nth args 1 nil) to (nth args 2 nil))
+          [(schema/rename-column-sql table from to)])
+      :alter-column
+        (let (table (nth args 0 nil) field (nth args 1 nil) changes (nth args 2 nil))
+          [(schema/alter-column-sql table field (dissoc changes :from))])
+      :create-index
+        (let (table (nth args 0 nil) idx (nth args 1 nil) opts (nth args 2 nil))
+          [(schema/create-index-sql table idx (or opts {}))])
+      :drop-index
+        (let (table (nth args 0 nil) idx (nth args 1 nil) opts (nth args 2 nil))
+          [(schema/drop-index-sql (if (map? idx) (get (schema/index-spec table idx) :name) idx)
+             (or opts {}))])
+      :execute [(first args)]
+      :run []
+      (error "migration: unknown step " (pr-str step)))))
+
+;; ---- reversal ---------------------------------------------------------------------
+
+(defn reverse-step (step)
+  "The step that undoes `step`, or nil when it cannot be derived."
+  (let (op (first step)
+        args (into [] (rest step)))
+    (case op
+      :create-table [:drop-table (first args) (second args)]
+      :drop-table (when (second args) [:create-table (first args) (second args)])
+      :rename-table [:rename-table (second args) (first args)]
+      :add-column [:drop-column (first args) (second args) (nth args 2)]
+      :drop-column (when (nth args 2 nil) [:add-column (first args) (second args) (nth args 2)])
+      :rename-column [:rename-column (first args) (nth args 2) (second args)]
+      :alter-column
+        (let (table (nth args 0 nil)
+              field (nth args 1 nil)
+              changes (nth args 2 nil)
+              from (get changes :from))
+          (when from [:alter-column table field (assoc from :from (dissoc changes :from :using))]))
+      :create-index [:drop-index (first args) (second args) (nth args 2 nil)]
+      :drop-index
+        (when (map? (second args)) [:create-index (first args) (second args) (nth args 2 nil)])
+      :execute (when (second args) [:execute (second args) (first args)])
+      :run (when (second args) [:run (second args) (first args)])
+      nil)))
+
+(defn down-steps (m)
+  "The steps that undo migration `m`: its `:down`, or its `:up` reversed step by step.
+  Raises naming the first step that cannot be reversed."
+  (or (get m :down)
+    (map (reverse (get m :up))
+      (fn (step)
+        (or (reverse-step step)
+          (error "migration: "
+            (get m :version)
+            " cannot be rolled back: "
+            (pr-str step)
+            " has no reverse — write the migration's :down"))))))
+
+;; ---- the model: the schema the migrations build -------------------------------------
+
+(defn- normal-field (spec)
+  (let (s (schema/field-spec spec)
+        base {:type (schema/column-type (get s :type))}
+        with-null (if (= (get s :null) false) (assoc base :null false) base)
+        with-default (if (contains? s :default)
+                       (assoc with-null :default (get s :default))
+                       with-null))
+    (if (get s :references)
+      (assoc with-default :references (get s :references))
+      with-default)))
+
+(defn- normal-index (table idx)
+  (let (spec (schema/index-spec table idx))
+    (into {}
+      (seq/filter [[:name (get spec :name)]
+                    [:columns (into [] (get spec :columns))]
+                    [:unique (= (get spec :unique) true)]
+                    [:where (get spec :where)]]
+        (fn (pair) (not (nil? (second pair))))))))
+
+(defn- update-table (model table f)
+  (let (current (get model table))
+    (when (nil? current) (error "migration: model: no table " (pr-str table)))
+    (assoc model table (f current))))
+
+(defn apply-step (model step)
+  "Fold one step into `model` — `{table {:fields {f spec} :primary-key k :indexes {name idx}}}`.
+  `:execute` and `:run` change nothing it can see."
+  (let (op (first step)
+        args (into [] (rest step)))
+    (case op
+      :create-table
+        (let (table (nth args 0 nil) definition (nth args 1 nil))
+          (if (and (get definition :if-not-exists) (contains? model table))
+            model
+            (assoc model
+              table
+                {:fields (reduce (keys (get definition :fields))
+                           {}
+                           (fn (acc f)
+                             (assoc acc f (normal-field (get (get definition :fields) f)))))
+                 :primary-key (get definition :primary-key)
+                 :indexes {}})))
+      :drop-table (dissoc model (first args))
+      :rename-table
+        (let (from (nth args 0 nil) to (nth args 1 nil))
+          (assoc (dissoc model from) to (get model from)))
+      :add-column
+        (let (table (nth args 0 nil) field (nth args 1 nil) spec (nth args 2 nil))
+          (update-table model
+            table
+            (fn (t) (assoc t :fields (assoc (get t :fields) field (normal-field spec))))))
+      :drop-column
+        (update-table model
+          (first args)
+          (fn (t) (assoc t :fields (dissoc (get t :fields) (second args)))))
+      :rename-column
+        (let (table (nth args 0 nil) from (nth args 1 nil) to (nth args 2 nil))
+          (update-table model
+            table
+            (fn (t)
+              (assoc t
+                :fields (assoc (dissoc (get t :fields) from) to (get (get t :fields) from))
+                :indexes
+                  (reduce (keys (get t :indexes))
+                    {}
+                    (fn (acc name)
+                      (let (idx (get (get t :indexes) name))
+                        (assoc acc
+                          name
+                            (assoc idx
+                              :columns
+                                (into [] (map (get idx :columns) (fn (c) (if (= c from) to c)))))))))))))
+      :alter-column
+        (let (table (nth args 0 nil) field (nth args 1 nil) changes (nth args 2 nil))
+          (update-table model
+            table
+            (fn (t)
+              (let (current (get (get t :fields) field)
+                    typed (if (contains? changes :type)
+                            (assoc current :type (schema/column-type (get changes :type)))
+                            current)
+                    nulled (cond
+                             (not (contains? changes :null)) typed
+                             (get changes :null) (dissoc typed :null)
+                             :else (assoc typed :null false))
+                    defaulted (cond
+                                (not (contains? changes :default)) nulled
+                                (nil? (get changes :default)) (dissoc nulled :default)
+                                :else (assoc nulled :default (get changes :default))))
+                (assoc t :fields (assoc (get t :fields) field defaulted))))))
+      :create-index
+        (let (table (nth args 0 nil)
+              idx (nth args 1 nil)
+              spec (normal-index table idx))
+          (update-table model
+            table
+            (fn (t) (assoc t :indexes (assoc (get t :indexes) (get spec :name) spec)))))
+      :drop-index
+        (let (table (nth args 0 nil)
+              idx (nth args 1 nil)
+              name (if (map? idx) (get (schema/index-spec table idx) :name) idx))
+          (update-table model table (fn (t) (assoc t :indexes (dissoc (get t :indexes) name)))))
+      model)))
+
+(defn model (migrations)
+  "The schema `migrations` build, applied in version order."
+  (fold (validate migrations) {} (fn (m migration) (fold (get migration :up) m apply-step))))
+
+(defn schema-model (schemas)
+  "The same model shape, from an app's schema maps."
+  (reduce schemas
+    {}
+    (fn (acc s)
+      (assoc acc
+        (get s :table)
+          {:fields (reduce (keys (get s :fields))
+                     {}
+                     (fn (fs f) (assoc fs f (normal-field (get (get s :fields) f)))))
+           :primary-key (get s :primary-key)
+           :indexes (reduce (schema/indexes s)
+                      {}
+                      (fn (is idx) (assoc is (get idx :name) (normal-index (get s :table) idx))))}))))
+
+;; ---- diffing: model → schemas ----------------------------------------------------------
+
+(defn- definition-of (t)
+  {:primary-key (get t :primary-key) :fields (get t :fields)})
+
+(defn- index-steps (table have want)
+  (append (map (seq/filter (keys have) (fn (name) (not (= (get have name) (get want name)))))
+            (fn (name) [:drop-index table (get have name)]))
+    (map (seq/filter (keys want) (fn (name) (not (= (get have name) (get want name)))))
+      (fn (name) [:create-index table (get want name)]))))
+
+(defn- changed-field-step (table field have want)
+  (let (changes (fold [:type :null :default]
+                  {}
+                  (fn (acc k)
+                    (if (= (get have k) (get want k))
+                      acc
+                      (assoc acc
+                        k (case k :null (if (= (get want k) false) false true) (get want k))))))
+        from (reduce (keys changes)
+               {}
+               (fn (acc k)
+                 (assoc acc k (case k :null (if (= (get have k) false) false true) (get have k))))))
+    [:alter-column table field (assoc changes :from from)]))
+
+(defn- table-steps (table have want)
+  (let (have-fields (get have :fields)
+        want-fields (get want :fields)
+        added (map (seq/filter (sort (keys want-fields)) (fn (f) (not (contains? have-fields f))))
+                (fn (f) [:add-column table f (get want-fields f)]))
+        dropped (map (seq/filter (sort (keys have-fields)) (fn (f) (not (contains? want-fields f))))
+                  (fn (f) [:drop-column table f (get have-fields f)]))
+        altered (map (seq/filter (sort (keys want-fields))
+                       (fn (f)
+                         (and (contains? have-fields f)
+                           (not (= (get have-fields f) (get want-fields f))))))
+                  (fn (f) (changed-field-step table f (get have-fields f) (get want-fields f)))))
+    (append added altered dropped (index-steps table (get have :indexes) (get want :indexes)))))
+
+(defn diff (have want)
+  "The steps taking model `have` to model `want`: tables created and dropped, columns
+  added, altered and dropped, indexes rebuilt. A rename reads as a drop and an add —
+  edit the generated migration into a `:rename-column` when that is what it is."
+  (let (tables (sort (seq/distinct (append (keys have) (keys want)))))
+    (into []
+      (mapcat tables
+        (fn (table)
+          (cond
+            (not (contains? have table))
+              (cons [:create-table table (definition-of (get want table))]
+                (map (vals (get (get want table) :indexes)) (fn (idx) [:create-index table idx])))
+            (not (contains? want table)) [[:drop-table table (definition-of (get have table))]]
+            :else (table-steps table (get have table) (get want table))))))))
+
+(defn check (migrations schemas)
+  "The steps by which `migrations` fall short of `schemas` — empty when they agree.
+  Only the tables `schemas` name are compared, so a table managed some other way is left
+  alone."
+  (let (want (schema-model schemas)
+        have (model migrations)
+        named (reduce (keys want)
+                {}
+                (fn (acc t) (if (contains? have t) (assoc acc t (get have t)) acc))))
+    (diff named want)))
+
+(defn version-now ()
+  "The current UTC time as a migration version, YYYYMMDDHHMMSS."
+  (string/->number (datetime/format (datetime/epoch-ms-> (os/now)) "%Y%m%d%H%M%S")))
+
+(defn generate (migrations schemas name &optional version)
+  "A new migration closing the gap `check` finds, or nil when there is none."
+  (let (steps (check migrations schemas))
+    (when (not (empty? steps))
+      {:version (or version (version-now)) :name name :up steps})))
+
+(defn render (m)
+  "Migration `m` as source text — one step per line, to paste into the app's list."
+  (str "{:version "
+    (get m :version)
+    "\n :name "
+    (pr-str (get m :name))
+    (if (= (get m :transaction?) false) "\n :transaction? false" "")
+    "\n :up ["
+    (string/join (map (get m :up) pr-str) "\n      ")
+    "]"
+    (if (get m :down)
+      (str "\n :down [" (string/join (map (get m :down) pr-str) "\n        ") "]")
+      "")
+    "}"))
+
+;; ---- running ----------------------------------------------------------------------
+;; Every runner takes `opts`; `:table` names the history table (default `*table*`), so
+;; two sets of migrations — or a test — can share a database without sharing a history.
+
+(defn- history (opts) (get opts :table *table*))
+
+(defn- ensure-table (conn table)
+  (repo/create-table conn
+    {:table table
+     :primary-key :version
+     :fields {:version [:bigint {:null false}] :name :text :inserted_at :bigint}}
+    {:if-not-exists true}))
+
+(defn- versions-in (conn table)
+  (into #{}
+    (map (repo/all conn (-> (query/from table) (query/select [:version])))
+      (fn (row) (get row :version)))))
+
+(defn applied (repo &optional (opts {}))
+  "The applied migrations' rows, oldest first (empty before the first migration)."
+  (repo/with-connection repo
+    (fn (conn)
+      (ensure-table conn (history opts))
+      (repo/all conn (-> (query/from (history opts)) (query/order-by :version))))))
+
+(defn- run-steps (conn steps log)
+  (doseq (step steps)
+    (if (= (first step) :run)
+      (do (log (str "  run " (pr-str (second step)))) ((second step) conn))
+      (doseq (sql (step-sql step))
+        (log (str "  " sql))
+        (repo/exec conn sql [])))))
+
+(defn- atomically (conn m f)
+  (if (= (get m :transaction?) false) (f conn) (repo/transaction conn f)))
+
+(defn- apply-up (conn table m log)
+  (log (str "== " (get m :version) " " (get m :name) " (up)"))
+  (atomically conn
+    m
+    (fn (tx)
+      (run-steps tx (get m :up) log)
+      (repo/insert tx
+        table
+        {:version (get m :version) :name (get m :name) :inserted_at (os/now)}
+        {:returning :none}))))
+
+(defn- apply-down (conn table m log)
+  (log (str "== " (get m :version) " " (get m :name) " (down)"))
+  (let (steps (down-steps m))
+    (atomically conn
+      m
+      (fn (tx)
+        (run-steps tx steps log)
+        (repo/delete tx table [:= :version (get m :version)] {:returning :none})))))
+
+(defn- with-migration-lock (repo table f)
+  (repo/with-lock repo
+    *lock-key*
+    (fn (conn)
+      (ensure-table conn table)
+      (f conn))))
+
+(defn pending (repo migrations &optional (opts {}))
+  "The migrations not yet applied, in version order."
+  (let (sorted (validate migrations)
+        table (history opts)
+        done (repo/with-connection repo
+               (fn (conn) (ensure-table conn table) (versions-in conn table))))
+    (seq/filter sorted (fn (m) (not (contains? done (get m :version)))))))
+
+(defn migrate (repo migrations &optional (opts {}))
+  "Apply every pending migration (up to `:to`, a version, when given), in order, under
+  the migration lock. `:log` receives a line per migration and statement. Returns the
+  migrations applied."
+  (let (sorted (validate migrations)
+        table (history opts)
+        log (get opts :log (fn (_) nil))
+        limit (get opts :to))
+    (with-migration-lock repo
+      table
+      (fn (conn)
+        (let (done (versions-in conn table)
+              todo (seq/filter sorted
+                     (fn (m)
+                       (and (not (contains? done (get m :version)))
+                         (or (nil? limit) (<= (get m :version) limit))))))
+          (doseq (m todo) (apply-up conn table m log))
+          (into [] todo))))))
+
+(defn rollback (repo migrations &optional (opts {}))
+  "Undo the newest applied migration — or the newest `:step` of them, or every one
+  after version `:to`. Refuses while the database holds a NEWER migration this list does
+  not know: undoing older ones beneath it would leave a schema no code describes.
+  Returns the migrations rolled back."
+  (let (sorted (validate migrations)
+        table (history opts)
+        log (get opts :log (fn (_) nil)))
+    (with-migration-lock repo
+      table
+      (fn (conn)
+        (let (done (versions-in conn table)
+              known (into #{} (map sorted (fn (m) (get m :version))))
+              unknown (sort (seq/filter (into [] done) (fn (v) (not (contains? known v)))))
+              applied-desc (reverse (seq/filter sorted (fn (m) (contains? done (get m :version)))))
+              chosen (if (contains? opts :to)
+                       (seq/filter applied-desc (fn (m) (> (get m :version) (get opts :to))))
+                       (take applied-desc (get opts :step 1))))
+          (when (and (not (empty? unknown))
+                  (or (empty? applied-desc) (> (last unknown) (get (first applied-desc) :version))))
+            (error "migration: the database has applied "
+              (pr-str unknown)
+              ", which this code does not know — roll back with the code that applied them"))
+          (doseq (m chosen) (apply-down conn table m log))
+          (into [] chosen))))))
+
+(defn status (repo migrations &optional (opts {}))
+  "Every migration with `:state` `:up` or `:down`, plus `:missing` for a version the
+  database applied that the list no longer has — oldest first."
+  (let (sorted (validate migrations)
+        rows (applied repo opts)
+        done (reduce rows {} (fn (acc row) (assoc acc (get row :version) row)))
+        known (into #{} (map sorted (fn (m) (get m :version))))
+        listed (map sorted
+                 (fn (m)
+                   {:version (get m :version)
+                    :name (get m :name)
+                    :state (if (contains? done (get m :version)) :up :down)}))
+        missing (map (seq/filter rows (fn (row) (not (contains? known (get row :version)))))
+                  (fn (row) {:version (get row :version) :name (get row :name) :state :missing})))
+    (sort-by (append listed missing) (fn (entry) (get entry :version)))))
+
+(defn plan (migrations versions-applied)
+  "The SQL `migrate` would run against a database holding `versions-applied` — a dry
+  run that needs no connection."
+  (let (done (into #{} versions-applied))
+    (mapcat (seq/filter (validate migrations) (fn (m) (not (contains? done (get m :version)))))
+      (fn (m)
+        (cons (str "-- " (get m :version) " " (get m :name))
+          (mapcat (get m :up)
+            (fn (step)
+              (if (= (first step) :run) [(str "-- run " (pr-str (second step)))] (step-sql step)))))))))

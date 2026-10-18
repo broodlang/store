@@ -1,22 +1,35 @@
 (defmodule schema
-  "Schema as data — one source of truth for a table's shape, from which the
-  migration (CREATE TABLE) is *derived*, so the two can't drift (an Ecto pain).
-  A schema is a plain map:
+  "Schema as data — one source of truth for a table's shape. A schema is a plain map:
 
-    {:table  :users
-     :fields {:id :integer :name :text :age :integer :balance :numeric}
-     :primary-key :id}
+    {:table :users
+     :primary-key :id
+     :fields {:id :serial
+              :email [:text {:null false}]
+              :role [:text {:null false :default \"member\"}]
+              :organisation_id [:integer {:references {:table :organisations :on-delete :cascade}}]}
+     :indexes [{:columns [:email] :unique true :name \"users_email_idx\"}
+               {:columns [:role] :where [:not-nil :role]}]}
 
-  `create-table-sql` / `drop-table-sql` render portable DDL; `repo/create-table` and
-  `repo/drop-table` run it. Field types are an abstract vocabulary mapped to SQL that
-  both Postgres and SQLite accept (SQLite via type affinity): :integer :text :real
-  :numeric :boolean (and aliases :int/:string/:float/:bool/:decimal). An unknown type
-  is emitted verbatim — the escape hatch for DB-specific column types."
+  A field is a type keyword, or `[type opts]` with `:null` (false = NOT NULL),
+  `:default` (a literal, or `[:raw \"now()\"]`) and `:references` (a table keyword, or
+  `{:table :column :on-delete :on-update}`). An index is `{:columns :unique :name :where}`;
+  its name defaults to `<table>_<columns>_index`. A changeset casts against the same
+  `:fields` (see `changeset/cast`), and `migration/check` proves the migrations build it.
+
+  Field types are an abstract vocabulary mapped to SQL: :integer :bigint :serial
+  :bigserial :text :real :numeric :boolean :bytea (and the aliases :int/:string/:float/
+  :bool/:decimal/:binary). An unknown type is emitted verbatim — the escape hatch for a
+  database-specific column type (`:uuid`, `:jsonb`).
+
+  The `*-sql` functions render the DDL the `migration` steps run."
   (:alias query))
 
 (def *type-sql*
   {:integer "integer"
    :int "integer"
+   :bigint "bigint"
+   :serial "serial"
+   :bigserial "bigserial"
    :text "text"
    :string "text"
    :real "real"
@@ -24,31 +37,204 @@
    :numeric "numeric"
    :decimal "numeric"
    :boolean "boolean"
-   :bool "boolean"})
+   :bool "boolean"
+   :bytea "bytea"
+   :binary "bytea"})
 
 (defn column-type (t)
+  "The SQL for the abstract type `t` (verbatim when it is not in the vocabulary)."
   (or (get *type-sql* t) (->string t)))
 
-(defn create-table-sql (s)
-  "Render `CREATE TABLE` from a schema map."
-  (let (fields (get s :fields)
-        cols (map (keys fields) (fn (f) (str (query/ident f) " " (column-type (get fields f)))))
-        pk (get s :primary-key)
-        pk-sql (if (nil? pk) "" (str ", PRIMARY KEY (" (query/ident pk) ")")))
-    (str "CREATE TABLE " (query/ident (get s :table)) " (" (string/join cols ", ") pk-sql ")")))
+(defn field-spec (spec)
+  "A field's spec in its long form, `{:type … :null … :default … :references …}`, from the
+  `:text` / `[:text {:null false}]` / `{:type :text}` a schema writes."
+  (cond
+    (map? spec) spec
+    (vector? spec) (assoc (or (second spec) {}) :type (first spec))
+    :else {:type spec}))
 
-(defn drop-table-sql (s)
-  (str "DROP TABLE IF EXISTS " (query/ident (get s :table))))
+(defn fields (s)
+  "`s`'s fields, each in its long form (`field-spec`)."
+  (reduce (keys (get s :fields)) {} (fn (acc f) (assoc acc f (field-spec (get (get s :fields) f))))))
 
-;; ---- ALTER (for migration diffing) ------------------------------------------
+;; ---- literals ------------------------------------------------------------------
+;; DDL takes no bind parameters, so a default, or a partial index's WHERE, is rendered
+;; as a literal: a string is quoted with its quotes doubled, so it cannot end early.
 
-(defn add-column-sql (table field type)
+(defn sql-literal (v)
+  "`v` as a SQL literal: NULL, TRUE/FALSE, a number, a quoted string, or a `[:raw …]`
+  fragment verbatim."
+  (cond
+    (nil? v) "NULL"
+    (= v true) "TRUE"
+    (= v false) "FALSE"
+    (number? v) (str v)
+    (decimal? v) (decimal/->string v)
+    (string? v) (str "'" (string/replace v "'" "''") "'")
+    (and (vector? v) (= (first v) :raw)) (second v)
+    :else (error "schema: no SQL literal for " (pr-str v))))
+
+(defn- inline-params (sql params index)
+  "Replace `$index`…`$1` with their literals, highest first (so `$1` never eats `$10`)."
+  (if (= index 0)
+    sql
+    (inline-params (string/replace sql (str "$" index) (sql-literal (nth params (- index 1))))
+      params
+      (- index 1))))
+
+(defn inline-expr (expr)
+  "Compile a query expression with its values inlined as literals — what DDL needs."
+  (let ([sql params] (query/compile-expr expr []))
+    (inline-params sql params (count params))))
+
+;; ---- columns -------------------------------------------------------------------
+
+(defn- references-sql (references)
+  (let (target (if (map? references) references {:table references})
+        column (get target :column :id))
+    (str " REFERENCES "
+      (query/ident (get target :table))
+      " ("
+      (query/ident column)
+      ")"
+      (if (get target :on-delete) (str " ON DELETE " (action-sql (get target :on-delete))) "")
+      (if (get target :on-update) (str " ON UPDATE " (action-sql (get target :on-update))) ""))))
+
+(defn- action-sql (action)
+  (case action
+    :cascade "CASCADE"
+    :restrict "RESTRICT"
+    :set-null "SET NULL"
+    :set-default "SET DEFAULT"
+    :no-action "NO ACTION"
+    (error "schema: unknown referential action " (pr-str action))))
+
+(defn column-sql (field spec)
+  "One column's definition: name, type, then NOT NULL / DEFAULT / REFERENCES."
+  (let (s (field-spec spec))
+    (str (query/ident field)
+      " "
+      (column-type (get s :type))
+      (if (= (get s :null) false) " NOT NULL" "")
+      (if (contains? s :default) (str " DEFAULT " (sql-literal (get s :default))) "")
+      (if (get s :references) (references-sql (get s :references)) ""))))
+
+;; ---- tables --------------------------------------------------------------------
+
+(defn- primary-key-columns (pk)
+  (cond
+    (nil? pk) []
+    (vector? pk) pk
+    :else [pk]))
+
+(defn create-table-sql (s &optional (opts {}))
+  "`CREATE TABLE` from a schema map. `opts`: `:if-not-exists`."
+  (let (field-map (get s :fields)
+        columns (map (keys field-map) (fn (f) (column-sql f (get field-map f))))
+        pk (primary-key-columns (get s :primary-key))
+        pk-sql (if (empty? pk)
+                 ""
+                 (str ", PRIMARY KEY (" (string/join (map pk query/ident) ", ") ")")))
+    (str "CREATE TABLE "
+      (if (get opts :if-not-exists) "IF NOT EXISTS " "")
+      (query/ident (get s :table))
+      " ("
+      (string/join columns ", ")
+      pk-sql
+      ")")))
+
+(defn- table-name (s) (if (map? s) (get s :table) s))
+
+(defn drop-table-sql (s &optional (opts {}))
+  "`DROP TABLE` for a schema map or a table name. `opts`: `:if-exists`, `:cascade`."
+  (str "DROP TABLE "
+    (if (get opts :if-exists) "IF EXISTS " "")
+    (query/ident (table-name s))
+    (if (get opts :cascade) " CASCADE" "")))
+
+(defn rename-table-sql (from to)
+  (str "ALTER TABLE " (query/ident from) " RENAME TO " (query/ident to)))
+
+(defn add-column-sql (table field spec &optional (opts {}))
+  "`ALTER TABLE … ADD COLUMN`. `opts`: `:if-not-exists`."
   (str "ALTER TABLE "
     (query/ident table)
     " ADD COLUMN "
-    (query/ident field)
-    " "
-    (column-type type)))
+    (if (get opts :if-not-exists) "IF NOT EXISTS " "")
+    (column-sql field spec)))
 
-(defn drop-column-sql (table field)
-  (str "ALTER TABLE " (query/ident table) " DROP COLUMN " (query/ident field)))
+(defn drop-column-sql (table field &optional (opts {}))
+  "`ALTER TABLE … DROP COLUMN`. `opts`: `:if-exists`."
+  (str "ALTER TABLE "
+    (query/ident table)
+    " DROP COLUMN "
+    (if (get opts :if-exists) "IF EXISTS " "")
+    (query/ident field)))
+
+(defn rename-column-sql (table from to)
+  (str "ALTER TABLE "
+    (query/ident table)
+    " RENAME COLUMN "
+    (query/ident from)
+    " TO "
+    (query/ident to)))
+
+(defn alter-column-sql (table field changes)
+  "One `ALTER TABLE` changing `field`: `changes` may set `:type` (with `:using`, an SQL
+  conversion expression), `:null` (false = SET NOT NULL, true = DROP NOT NULL), and
+  `:default` (a literal; nil drops it)."
+  (let (column (str "ALTER COLUMN " (query/ident field))
+        actions (seq/filter [(when (contains? changes :type)
+                               (str column
+                                 " TYPE "
+                                 (column-type (get changes :type))
+                                 (if (get changes :using) (str " USING " (get changes :using)) "")))
+                              (when (contains? changes :null)
+                                (str column
+                                  (if (get changes :null) " DROP NOT NULL" " SET NOT NULL")))
+                              (when (contains? changes :default)
+                                (if (nil? (get changes :default))
+                                  (str column " DROP DEFAULT")
+                                  (str column " SET DEFAULT " (sql-literal (get changes :default)))))]
+                  (fn (a) (not (nil? a)))))
+    (when (empty? actions)
+      (error "schema: alter-column " (pr-str field) " changes nothing: " (pr-str changes)))
+    (str "ALTER TABLE " (query/ident table) " " (string/join actions ", "))))
+
+;; ---- indexes -------------------------------------------------------------------
+
+(defn index-name (table columns)
+  "The default name of an index on `table`'s `columns`: `<table>_<columns>_index`."
+  (str (->string table) "_" (string/join (map columns ->string) "_") "_index"))
+
+(defn index-spec (table idx)
+  "An index in its long form, with its `:name` filled in."
+  (assoc idx :name (or (get idx :name) (index-name table (get idx :columns)))))
+
+(defn indexes (s)
+  "`s`'s indexes, each in its long form."
+  (map (or (get s :indexes) []) (fn (idx) (index-spec (get s :table) idx))))
+
+(defn create-index-sql (table idx &optional (opts {}))
+  "`CREATE [UNIQUE] INDEX` for index `idx` on `table`. `opts`: `:concurrently` (builds
+  without blocking writes — and cannot run in a transaction), `:if-not-exists`."
+  (let (spec (index-spec table idx))
+    (str "CREATE "
+      (if (get spec :unique) "UNIQUE " "")
+      "INDEX "
+      (if (get opts :concurrently) "CONCURRENTLY " "")
+      (if (get opts :if-not-exists) "IF NOT EXISTS " "")
+      (query/ident (get spec :name))
+      " ON "
+      (query/ident table)
+      " ("
+      (string/join (map (get spec :columns) query/ident) ", ")
+      ")"
+      (if (get spec :where) (str " WHERE " (inline-expr (get spec :where))) ""))))
+
+(defn drop-index-sql (name &optional (opts {}))
+  "`DROP INDEX`. `opts`: `:concurrently`, `:if-exists`."
+  (str "DROP INDEX "
+    (if (get opts :concurrently) "CONCURRENTLY " "")
+    (if (get opts :if-exists) "IF EXISTS " "")
+    (query/ident name)))

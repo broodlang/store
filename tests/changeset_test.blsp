@@ -1,33 +1,135 @@
-;; Changesets — pure validation/permit pipeline. No database.
+;; Changesets — the cast/validate pipeline. No database.
 (defmodule changeset-test
   (:use test)
-  (:use changeset))
+  (:alias changeset))
 
-(describe "changeset"
-  (test "permit keeps only allowed fields present in params (mass-assignment guard)"
-    (let (cs (-> (change {:name "ada" :email "a@b" :role "admin"})
-               (permit [:name :email])))
-      (is (= (changes cs) {:name "ada" :email "a@b"}))
-      (is (valid? cs))))
-  (test "validate-required flags missing and blank fields"
-    (let (cs (-> (change {:name ""})
-               (permit [:name :email])
-               (validate-required [:name :email])))
-      (refute (valid? cs))
-      (is (= (count (errors cs)) 2))))
-  (test "validate runs a predicate on a present field"
-    (let (cs (-> (change {:age -5})
-               (permit [:age])
-               (validate :age (fn (a) (>= a 0)) "must be non-negative")))
-      (refute (valid? cs))
-      (is (= (errors cs) [[:age "must be non-negative"]]))))
-  (test "a passing pipeline yields changes + apply-changes (update form)"
-    (let (cs (-> (change {:id 1 :name "old"} {:name "new" :ignored 9})
-               (permit [:name])
-               (validate-required [:name])
-               (validate :name (fn (n) (> (count n) 0)) "blank")))
-      (is (valid? cs))
-      (is (= (changes cs) {:name "new"}))
-      (is (= (apply-changes cs) {:id 1 :name "new"}))))
-  (test "put-change sets a derived field"
-    (is (= (changes (-> (change {}) (put-change :slug "x"))) {:slug "x"}))))
+(def users
+  {:table :users
+   :primary-key :id
+   :fields {:id :serial
+            :email [:text {:null false}]
+            :age :integer
+            :admin :boolean
+            :score :numeric
+            :ratio :float}})
+
+(describe "changeset: cast"
+  (test "takes only permitted fields, under string or keyword keys (the mass-assignment guard)"
+    (let (cs (changeset/cast {} {"email" "a@b" :age "3" "role" "admin"} [:email :age] users))
+      (is (= (changeset/changes cs) {:email "a@b" :age 3}))
+      (is (changeset/valid? cs))))
+  (test "converts to the schema's types"
+    (let (cs (changeset/cast {}
+               {"age" " 42 " "admin" "on" "score" "1.50" "ratio" "2"}
+               [:age :admin :score :ratio]
+               users))
+      (is (= (changeset/changes cs) {:age 42 :admin true :score 1.50M :ratio 2.0}))))
+  (test "a value that will not convert is invalid"
+    (let (cs (changeset/cast {} {"age" "4.5" "admin" "maybe"} [:age :admin] users))
+      (refute (changeset/valid? cs))
+      (is (= (changeset/error-messages cs) {:age ["is invalid"] :admin ["is invalid"]}))))
+  (test "a blank string is nil"
+    (is (= (changeset/changes (changeset/cast {:email "x"} {"email" "  "} [:email] users))
+          {:email nil})))
+  (test "a value equal to the data's is not a change"
+    (is (= (changeset/changes (changeset/cast {:id 1 :age 3} {"age" "3"} [:age] users)) {})))
+  (test "a field not sent is not touched"
+    (is (= (changeset/changes (changeset/cast {:id 1 :email "a@b"} {"age" "5"} [:email :age] users))
+          {:age 5})))
+  (test "a schema names the table and the primary key"
+    (let (cs (changeset/cast {} {} [] users))
+      (is (= (changeset/source cs) :users))
+      (is (= (changeset/primary-key cs) :id))))
+  (test "a plain types map works with no table"
+    (let (cs (changeset/cast {} {"n" "7"} [:n] {:n :integer}))
+      (is (= (changeset/changes cs) {:n 7}))
+      (is (nil? (changeset/source cs)))))
+  (test "change applies trusted changes as they are"
+    (is (= (changeset/changes (changeset/change {:a 1} {:a 1 :b 2})) {:b 2}))))
+
+(describe "changeset: validations"
+  (test "required looks at the data too — an update need not resend a field"
+    (let (cs (-> (changeset/cast {:id 1 :email "a@b"} {"age" "5"} [:email :age] users)
+               (changeset/validate-required [:email])))
+      (is (changeset/valid? cs))))
+  (test "required flags missing and blank, once per field"
+    (let (cs (-> (changeset/cast {} {"email" " "} [:email :age] users)
+               (changeset/validate-required [:email :age])))
+      (is (= (changeset/error-messages cs) {:email ["can't be blank"] :age ["can't be blank"]}))))
+  (test "a field that failed to cast is not also reported blank"
+    (let (cs (-> (changeset/cast {} {"age" "x"} [:age] users) (changeset/validate-required [:age])))
+      (is (= (changeset/error-messages cs) {:age ["is invalid"]}))))
+  (test "length interpolates its bound"
+    (let (cs (-> (changeset/cast {} {"email" "ab"} [:email] users)
+               (changeset/validate-length :email {:min 3 :max 10})))
+      (is (= (changeset/error-for cs :email) "should be at least 3 character(s)"))))
+  (test "number"
+    (let (cs (-> (changeset/cast {} {"age" "-1"} [:age] users)
+               (changeset/validate-number :age {:greater-than-or-equal-to 0})))
+      (is (= (changeset/error-for cs :age) "must be greater than or equal to 0"))))
+  (test "format, inclusion, exclusion"
+    (let (cs (-> (changeset/cast {} {"email" "nope" "age" "3"} [:email :age] users)
+               (changeset/validate-format :email "@")
+               (changeset/validate-inclusion :age [1 2])))
+      (is (= (changeset/error-messages cs) {:email ["has invalid format"] :age ["is invalid"]})))
+    (is (= (changeset/error-for (-> (changeset/cast {} {"email" "root"} [:email] users)
+                                  (changeset/validate-exclusion :email ["root"]))
+             :email)
+          "is reserved")))
+  (test "validations judge changes only"
+    (is (changeset/valid? (-> (changeset/cast {:id 1 :email "bad"} {} [:email] users)
+                            (changeset/validate-format :email "@")))))
+  (test "confirmation lands on the confirmation field"
+    (let (cs (-> (changeset/cast {}
+                   {"password" "secret1" "password_confirmation" "secret2"}
+                   [:password]
+                   {:password :text})
+               (changeset/validate-confirmation :password)))
+      (is (= (changeset/error-messages cs) {:password_confirmation ["does not match confirmation"]}))))
+  (test "acceptance"
+    (refute (changeset/valid? (changeset/validate-acceptance (changeset/cast {} {} [] {}) :terms)))
+    (is (changeset/valid? (changeset/validate-acceptance (changeset/cast {} {"terms" "on"} [] {})
+                            :terms))))
+  (test "validate-change takes a message or nil"
+    (let (cs (-> (changeset/cast {} {"email" "a@example.com"} [:email] users)
+               (changeset/validate-change :email
+                 (fn (v) (when (string/ends-with? v "example.com") "is not deliverable")))))
+      (is (= (changeset/error-for cs :email) "is not deliverable"))))
+  (test "put-change derives a field"
+    (is (= (changeset/changes (-> (changeset/change {}) (changeset/put-change :slug "x")))
+          {:slug "x"}))))
+
+(describe "changeset: results"
+  (test "apply-changes merges onto the data"
+    (is (= (changeset/apply-changes (changeset/cast {:id 1 :email "a"} {"email" "b"} [:email] users))
+          {:id 1 :email "b"})))
+  (test "apply-action"
+    (is (= (changeset/apply-action (changeset/cast {} {"age" "1"} [:age] users) :check)
+          [:ok {:age 1}]))
+    (let ([tag cs] (changeset/apply-action (changeset/cast {} {"age" "x"} [:age] users) :check))
+      (is (= tag :error))
+      (is (= (changeset/action cs) :check))))
+  (test "get-field prefers the change, then the data"
+    (let (cs (changeset/cast {:email "old" :age 1} {"email" "new"} [:email] users))
+      (is (= (changeset/get-field cs :email) "new"))
+      (is (= (changeset/get-field cs :age) 1))
+      (is (= (changeset/get-field cs :nope :d) :d)))))
+
+(describe "changeset: constraints"
+  (test "a declared constraint turns the database's error into a field error"
+    (let (cs (-> (changeset/cast {} {"email" "a@b"} [:email] users)
+               (changeset/unique-constraint :email {:name "users_email_idx"})))
+      (is (= (changeset/error-for (changeset/constraint-error cs
+                                    {:violation :unique :constraint "users_email_idx"})
+               :email)
+            "has already been taken"))))
+  (test "an undeclared constraint is nil — the caller re-raises"
+    (let (cs (-> (changeset/cast {} {} [] users)
+               (changeset/unique-constraint :email {:name "users_email_idx"})))
+      (is (nil? (changeset/constraint-error cs {:violation :unique :constraint "other_idx"})))
+      (is (nil? (changeset/constraint-error cs
+                  {:violation :foreign-key :constraint "users_email_idx"})))
+      (is (nil? (changeset/constraint-error cs "a plain error")))))
+  (test "the default name comes from the table"
+    (let (cs (-> (changeset/cast {} {} [] users) (changeset/foreign-key-constraint :org_id)))
+      (is (= (get (first (get cs :constraints)) :name) "users_org_id_index")))))

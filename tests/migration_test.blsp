@@ -1,0 +1,107 @@
+;; Migrations as data: SQL, reversal, the model they build and the diff against schemas.
+;; No database — the runner is exercised against Postgres in store-postgres.
+(defmodule migration-test
+  (:use test)
+  (:alias migration))
+
+(def users-v1
+  {:version 20260101000000
+   :name "users"
+   :up [[:create-table :users {:primary-key :id :fields {:id :serial :email [:text {:null false}]}}]
+         [:create-index :users {:columns [:email] :unique true :name "users_email_idx"}]]})
+
+(def users-v2
+  {:version 20260102000000
+   :name "users-handle"
+   :up [[:add-column :users :handle :text]
+         [:execute "UPDATE users SET handle = email"]
+         [:alter-column :users :handle {:null false :from {:null true}}]]})
+
+(def users-schema
+  {:table :users
+   :primary-key :id
+   :fields {:id :serial :email [:text {:null false}] :handle [:text {:null false}]}
+   :indexes [{:columns [:email] :unique true :name "users_email_idx"}]})
+
+(describe "migration: validate"
+  (test "sorts by version"
+    (is (= (map (migration/validate [users-v2 users-v1]) (fn (m) (get m :version)))
+          (list 20260101000000 20260102000000))))
+  (test "a repeated version, an unknown step, a concurrent index in a transaction"
+    (assert-error (migration/validate [users-v1 users-v1]))
+    (assert-error (migration/validate [{:version 1 :name "x" :up [[:frobnicate :t]]}]))
+    (assert-error (migration/validate [{:version 1
+                                        :name "x"
+                                        :up [[:create-index :t {:columns [:a]} {:concurrently true}]]}]))
+    (is (= (count (migration/validate [{:version 1
+                                        :name "x"
+                                        :transaction? false
+                                        :up [[:create-index :t {:columns [:a]} {:concurrently true}]]}]))
+          1))))
+
+(describe "migration: steps"
+  (test "step-sql"
+    (is (= (migration/step-sql [:add-column :users :handle :text])
+          ["ALTER TABLE \"users\" ADD COLUMN \"handle\" text"]))
+    (is (= (migration/step-sql [:alter-column :users :handle {:null false :from {:null true}}])
+          ["ALTER TABLE \"users\" ALTER COLUMN \"handle\" SET NOT NULL"]))
+    (is (= (migration/step-sql [:drop-index :users {:columns [:email]}])
+          ["DROP INDEX \"users_email_index\""]))
+    (is (= (migration/step-sql [:run (fn (_) nil)]) [])))
+  (test "every reversible step reverses"
+    (is (= (migration/reverse-step [:add-column :users :handle :text])
+          [:drop-column :users :handle :text]))
+    (is (= (migration/reverse-step [:rename-column :users :a :b]) [:rename-column :users :b :a]))
+    (is (= (migration/reverse-step [:alter-column :users :h {:null false :from {:null true}}])
+          [:alter-column :users :h {:null true :from {:null false}}]))
+    (is (= (migration/reverse-step [:execute "up" "down"]) [:execute "down" "up"])))
+  (test "irreversible steps say so"
+    (is (nil? (migration/reverse-step [:execute "up"])))
+    (is (nil? (migration/reverse-step [:drop-column :users :handle])))
+    (assert-error (migration/down-steps users-v2)))
+  (test "down-steps reverses in reverse order"
+    (is (= (migration/down-steps users-v1)
+          (list [:drop-index :users {:columns [:email] :unique true :name "users_email_idx"} nil]
+            [:drop-table
+              :users {:primary-key :id :fields {:id :serial :email [:text {:null false}]}}])))))
+
+(describe "migration: model, check, generate"
+  (test "the model is the schema the migrations build"
+    (let (m (migration/model [users-v1 users-v2]))
+      (is (= (get (get (get m :users) :fields) :handle) {:type "text" :null false}))
+      (is (contains? (get (get m :users) :indexes) "users_email_idx"))))
+  (test "check is empty when migrations and schemas agree"
+    (is (= (migration/check [users-v1 users-v2] [users-schema]) [])))
+  (test "check names what the migrations lack"
+    (is (= (migration/check [users-v1] [users-schema])
+          [[:add-column :users :handle {:type "text" :null false}]])))
+  (test "a changed column is an alter with its :from, so it reverses"
+    (is (= (migration/check [users-v1 users-v2]
+             [(assoc users-schema :fields (assoc (get users-schema :fields) :handle :text))])
+          [[:alter-column :users :handle {:null true :from {:null false}}]])))
+  (test "a new table is created with its indexes"
+    (let (steps (migration/check [] [users-schema]))
+      (is (= (first (first steps)) :create-table))
+      (is (= (first (second steps)) :create-index))))
+  (test "tables the schemas do not name are left alone"
+    (is (= (migration/check [users-v1
+                              users-v2
+                              {:version 3
+                               :name "other"
+                               :up [[:create-table :other {:fields {:a :text}}]]}]
+             [users-schema])
+          [])))
+  (test "generate gives a migration, render its source"
+    (let (m (migration/generate [users-v1] [users-schema] "add-handle" 20260103000000))
+      (is (= (get m :version) 20260103000000))
+      (is (string/starts-with? (migration/render m)
+            "{:version 20260103000000\n :name \"add-handle\""))))
+  (test "generate is nil when nothing is missing"
+    (is (nil? (migration/generate [users-v1 users-v2] [users-schema] "nothing"))))
+  (test "plan lists the SQL a database would get"
+    (is (= (migration/plan [users-v1 users-v2] [20260101000000])
+          (list "-- 20260102000000 users-handle"
+            "ALTER TABLE \"users\" ADD COLUMN \"handle\" text" "UPDATE users SET handle = email"
+            "ALTER TABLE \"users\" ALTER COLUMN \"handle\" SET NOT NULL"))))
+  (test "version-now is a 14-digit timestamp"
+    (is (= (string/length (str (migration/version-now))) 14))))

@@ -1,17 +1,66 @@
 ;; Schema-as-data → DDL. No database.
 (defmodule schema-test
   (:use test)
-  (:use schema))
+  (:alias schema))
 
-(describe "schema"
+(describe "schema: tables"
   (test "create-table-sql renders DDL with a primary key"
-    (is (= (create-table-sql {:table :users :fields {:id :integer} :primary-key :id})
-          "CREATE TABLE users (id integer, PRIMARY KEY (id))")))
-  (test "abstract type vocabulary maps to portable SQL"
-    (is (= (column-type :integer) "integer"))
-    (is (= (column-type :text) "text"))
-    (is (= (column-type :decimal) "numeric"))
-    (is (= (column-type :boolean) "boolean"))
-    (is (= (column-type :uuid) "uuid"))) ; unknown type → emitted verbatim
+    (is (= (schema/create-table-sql {:table :users :fields {:id :integer} :primary-key :id})
+          "CREATE TABLE \"users\" (\"id\" integer, PRIMARY KEY (\"id\"))")))
+  (test "if-not-exists, and a composite primary key"
+    (is (= (schema/create-table-sql {:table :t :fields {:a :text} :primary-key [:a :b]}
+             {:if-not-exists true})
+          "CREATE TABLE IF NOT EXISTS \"t\" (\"a\" text, PRIMARY KEY (\"a\", \"b\"))")))
+  (test "abstract type vocabulary maps to SQL"
+    (is (= (schema/column-type :integer) "integer"))
+    (is (= (schema/column-type :text) "text"))
+    (is (= (schema/column-type :decimal) "numeric"))
+    (is (= (schema/column-type :boolean) "boolean"))
+    (is (= (schema/column-type :binary) "bytea"))
+    (is (= (schema/column-type :uuid) "uuid")))
   (test "drop-table-sql"
-    (is (= (drop-table-sql {:table :users}) "DROP TABLE IF EXISTS users"))))
+    (is (= (schema/drop-table-sql {:table :users}) "DROP TABLE \"users\""))
+    (is (= (schema/drop-table-sql :users {:if-exists true :cascade true})
+          "DROP TABLE IF EXISTS \"users\" CASCADE"))))
+
+(describe "schema: columns"
+  (test "a field spec in short and long form"
+    (is (= (schema/field-spec :text) {:type :text}))
+    (is (= (schema/field-spec [:text {:null false}]) {:type :text :null false}))
+    (is (= (schema/field-spec {:type :text}) {:type :text})))
+  (test "NOT NULL, DEFAULT and REFERENCES"
+    (is (= (schema/column-sql :role [:text {:null false :default "it's"}])
+          "\"role\" text NOT NULL DEFAULT 'it''s'"))
+    (is (= (schema/column-sql :org [:integer {:references {:table :orgs :on-delete :cascade}}])
+          "\"org\" integer REFERENCES \"orgs\" (\"id\") ON DELETE CASCADE"))
+    (is (= (schema/column-sql :at [:bigint {:default [:raw "0"]}]) "\"at\" bigint DEFAULT 0")))
+  (test "add / drop / rename / alter"
+    (is (= (schema/add-column-sql :users :handle :text {:if-not-exists true})
+          "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"handle\" text"))
+    (is (= (schema/drop-column-sql :users :handle) "ALTER TABLE \"users\" DROP COLUMN \"handle\""))
+    (is (= (schema/rename-column-sql :users :a :b)
+          "ALTER TABLE \"users\" RENAME COLUMN \"a\" TO \"b\""))
+    (is (= (schema/alter-column-sql :users :n {:type :bigint :null false :default nil})
+          (str "ALTER TABLE \"users\" ALTER COLUMN \"n\" TYPE bigint, ALTER COLUMN \"n\" SET NOT NULL, "
+            "ALTER COLUMN \"n\" DROP DEFAULT"))))
+  (test "an alter that changes nothing is an error"
+    (assert-error (schema/alter-column-sql :users :n {}))))
+
+(describe "schema: indexes"
+  (test "default name, unique, partial with an inlined literal"
+    (is (= (schema/create-index-sql :users {:columns [:email] :unique true})
+          "CREATE UNIQUE INDEX \"users_email_index\" ON \"users\" (\"email\")"))
+    (is (= (schema/create-index-sql :p
+             {:columns [:project_id :operation_id]
+              :name "p_changes"
+              :where [:like :name "change/%"]}
+             {:concurrently true :if-not-exists true})
+          (str "CREATE INDEX CONCURRENTLY IF NOT EXISTS \"p_changes\" ON \"p\" (\"project_id\", \"operation_id\") "
+            "WHERE \"name\" LIKE 'change/%'"))))
+  (test "drop-index-sql"
+    (is (= (schema/drop-index-sql "users_email_index" {:if-exists true})
+          "DROP INDEX IF EXISTS \"users_email_index\"")))
+  (test "indexes fills in each name"
+    (is (= (map (schema/indexes {:table :t :indexes [{:columns [:a]} {:columns [:b] :name "x"}]})
+             (fn (i) (get i :name)))
+          (list "t_a_index" "x")))))

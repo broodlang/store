@@ -1,52 +1,141 @@
 ;; Query-as-data → SQL compilation. Pure, no database needed.
 (defmodule query-test
   (:use test)
-  (:use query))
+  (:alias query))
 
 (describe "query: to-sql"
   (test "select all"
-    (is (= (to-sql (from :users)) ["SELECT * FROM users" []])))
+    (is (= (query/to-sql (query/from :users)) ["SELECT * FROM \"users\"" []])))
   (test "columns, where, order, limit (params numbered in order)"
-    (is (= (to-sql (-> (from :users)
-                     (select [:id :name])
-                     (where [:= :email "a@b.c"])
-                     (order-by :name)
-                     (limit 10)))
-          ["SELECT id, name FROM users WHERE email = $1 ORDER BY name ASC LIMIT $2"
+    (is (= (query/to-sql (-> (query/from :users)
+                           (query/select [:id :name])
+                           (query/where [:= :email "a@b.c"])
+                           (query/order-by :name)
+                           (query/limit 10)))
+          ["SELECT \"id\", \"name\" FROM \"users\" WHERE \"email\" = $1 ORDER BY \"name\" ASC LIMIT $2"
             ["a@b.c" 10]])))
   (test "repeated where conjoins with AND"
-    (is (= (to-sql (-> (from :u) (where [:> :age 18]) (where [:< :age 65])))
-          ["SELECT * FROM u WHERE (age > $1 AND age < $2)" [18 65]])))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:> :age 18]) (query/where [:< :age 65])))
+          ["SELECT * FROM \"u\" WHERE (\"age\" > $1 AND \"age\" < $2)" [18 65]])))
   (test "in expands to a placeholder per element"
-    (is (= (to-sql (-> (from :u) (where [:in :id [1 2 3]])))
-          ["SELECT * FROM u WHERE id IN ($1, $2, $3)" [1 2 3]])))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:in :id [1 2 3]])))
+          ["SELECT * FROM \"u\" WHERE \"id\" IN ($1, $2, $3)" [1 2 3]])))
+  (test "an empty in is FALSE, an empty not-in TRUE — never the invalid `IN ()`"
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:in :id []])))
+          ["SELECT * FROM \"u\" WHERE FALSE" []]))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:not-in :id []])))
+          ["SELECT * FROM \"u\" WHERE TRUE" []])))
   (test "like / is-nil / not-nil"
-    (is (= (to-sql (-> (from :u) (where [:like :name "%x%"])))
-          ["SELECT * FROM u WHERE name LIKE $1" ["%x%"]]))
-    (is (= (to-sql (-> (from :u) (where [:is-nil :deleted_at])))
-          ["SELECT * FROM u WHERE deleted_at IS NULL" []]))
-    (is (= (to-sql (-> (from :u) (where [:not-nil :email])))
-          ["SELECT * FROM u WHERE email IS NOT NULL" []])))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:like :name "%x%"])))
+          ["SELECT * FROM \"u\" WHERE \"name\" LIKE $1" ["%x%"]]))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:is-nil :deleted_at])))
+          ["SELECT * FROM \"u\" WHERE \"deleted_at\" IS NULL" []]))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:not-nil :email])))
+          ["SELECT * FROM \"u\" WHERE \"email\" IS NOT NULL" []])))
   (test "or / not / nesting"
-    (is (= (to-sql (-> (from :u) (where [:or [:= :a 1] [:= :b 2]])))
-          ["SELECT * FROM u WHERE (a = $1 OR b = $2)" [1 2]]))
-    (is (= (to-sql (-> (from :u) (where [:not [:= :a 1]])))
-          ["SELECT * FROM u WHERE NOT (a = $1)" [1]])))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:or [:= :a 1] [:= :b 2]])))
+          ["SELECT * FROM \"u\" WHERE (\"a\" = $1 OR \"b\" = $2)" [1 2]]))
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:not [:= :a 1]])))
+          ["SELECT * FROM \"u\" WHERE NOT (\"a\" = $1)" [1]])))
   (test "order desc + offset"
-    (is (= (to-sql (-> (from :u) (order-by :id :desc) (limit 5) (offset 10)))
-          ["SELECT * FROM u ORDER BY id DESC LIMIT $1 OFFSET $2" [5 10]])))
+    (is (= (query/to-sql (-> (query/from :u)
+                           (query/order-by :id :desc)
+                           (query/limit 5)
+                           (query/offset 10)))
+          ["SELECT * FROM \"u\" ORDER BY \"id\" DESC LIMIT $1 OFFSET $2" [5 10]])))
+  (test "identifiers are quoted, so a reserved word is a column name"
+    (is (= (query/to-sql (-> (query/from :t) (query/select [:order :t.user :t.*])))
+          ["SELECT \"order\", \"t\".\"user\", \"t\".* FROM \"t\"" []])))
+  (test "a value is bound even when it looks like SQL"
+    (is (= (query/to-sql (-> (query/from :u) (query/where [:= :name "x'; DROP TABLE u; --"])))
+          ["SELECT * FROM \"u\" WHERE \"name\" = $1" ["x'; DROP TABLE u; --"]])))
   (test "a query is just data — inspectable and composable"
-    (let (base (-> (from :users) (where [:= :active true])))
+    (let (base (-> (query/from :users) (query/where [:= :active true])))
       (is (= (get base :from) :users))
-      ;; extend dynamically like any map
-      (is (= (to-sql (limit base 1)) ["SELECT * FROM users WHERE active = $1 LIMIT $2" [true 1]])))))
+      (is (= (query/to-sql (query/limit base 1))
+            ["SELECT * FROM \"users\" WHERE \"active\" = $1 LIMIT $2" [true 1]])))))
+
+(describe "query: joins, aggregates, subqueries"
+  (test "a join compares two columns with [:col …]"
+    (is (= (query/to-sql (-> (query/from :organisations :o)
+                           (query/select [:o.id :m.role])
+                           (query/join :members :m [:= :m.organisation_id [:col :o.id]])
+                           (query/where [:= :m.user_id 7])))
+          [(str "SELECT \"o\".\"id\", \"m\".\"role\" FROM \"organisations\" AS \"o\" "
+             "JOIN \"members\" AS \"m\" ON \"m\".\"organisation_id\" = \"o\".\"id\" "
+             "WHERE \"m\".\"user_id\" = $1")
+            [7]])))
+  (test "left join"
+    (is (= (first (query/to-sql (-> (query/from :a)
+                                  (query/left-join :b nil [:= :b.a_id [:col :a.id]]))))
+          "SELECT * FROM \"a\" LEFT JOIN \"b\" ON \"b\".\"a_id\" = \"a\".\"id\"")))
+  (test "aggregates, aliases, group by, having"
+    (is (= (query/to-sql (-> (query/from :objects)
+                           (query/select [:kind [:as [:count] :n] [:as [:sum :bytes] :total]])
+                           (query/group-by [:kind])
+                           (query/having [:> [:count] 1])))
+          [(str "SELECT \"kind\", count(*) AS \"n\", sum(\"bytes\") AS \"total\" FROM \"objects\" "
+             "GROUP BY \"kind\" HAVING count(*) > $1")
+            [1]])))
+  (test "distinct and count-distinct"
+    (is (= (first (query/to-sql (-> (query/from :o) (query/select [:pack]) (query/distinct))))
+          "SELECT DISTINCT \"pack\" FROM \"o\""))
+    (is (= (first (query/to-sql (-> (query/from :o) (query/select [[:count-distinct :pack]]))))
+          "SELECT count(DISTINCT \"pack\") FROM \"o\"")))
+  (test "a subquery numbers its parameters after the outer query's"
+    (is (= (query/to-sql (-> (query/from :packages)
+                           (query/where [:= :kind "app"])
+                           (query/where [:in
+                                          :id (-> (query/from :owners)
+                                            (query/select [:package_id])
+                                            (query/where [:= :user_id 3]))])))
+          [(str "SELECT * FROM \"packages\" WHERE (\"kind\" = $1 AND \"id\" IN "
+             "(SELECT \"package_id\" FROM \"owners\" WHERE \"user_id\" = $2))")
+            ["app" 3]])))
+  (test "exists"
+    (is (= (first (query/to-sql (-> (query/from :u)
+                                  (query/where [:exists
+                                                 (-> (query/from :t)
+                                                   (query/where [:= :t.u [:col :u.id]]))]))))
+          "SELECT * FROM \"u\" WHERE EXISTS (SELECT * FROM \"t\" WHERE \"t\".\"u\" = \"u\".\"id\")")))
+  (test "lock"
+    (is (= (first (query/to-sql (-> (query/from :u) (query/lock "FOR UPDATE"))))
+          "SELECT * FROM \"u\" FOR UPDATE")))
+  (test "raw is the escape hatch"
+    (is (= (first (query/to-sql (-> (query/from :p) (query/where [:like :name [:raw "'change/%'"]]))))
+          "SELECT * FROM \"p\" WHERE \"name\" LIKE 'change/%'"))))
 
 (describe "query: DML"
   (test "insert-sql (single column → deterministic)"
-    (is (= (insert-sql :users {:name "ada"})
-          ["INSERT INTO users (name) VALUES ($1) RETURNING *" ["ada"]])))
+    (is (= (query/insert-sql :users {:name "ada"})
+          ["INSERT INTO \"users\" (\"name\") VALUES ($1) RETURNING *" ["ada"]])))
+  (test "returning a column list, or nothing"
+    (is (= (first (query/insert-sql :users {:name "ada"} {:returning [:id]}))
+          "INSERT INTO \"users\" (\"name\") VALUES ($1) RETURNING \"id\""))
+    (is (= (first (query/insert-sql :users {:name "ada"} {:returning :none}))
+          "INSERT INTO \"users\" (\"name\") VALUES ($1)")))
+  (test "several rows in one statement"
+    (is (= (query/insert-all-sql :t [{:a 1} {:a 2}] {:returning :none})
+          ["INSERT INTO \"t\" (\"a\") VALUES ($1), ($2)" [1 2]])))
+  (test "on conflict do nothing / replace / set"
+    (is (= (first (query/insert-sql :t {:a 1} {:on-conflict {:target [:a]} :returning :none}))
+          "INSERT INTO \"t\" (\"a\") VALUES ($1) ON CONFLICT (\"a\") DO NOTHING"))
+    (is (= (first (query/insert-sql :t
+                    {:a 1}
+                    {:on-conflict {:target [:a] :do [:a]} :returning :none}))
+          "INSERT INTO \"t\" (\"a\") VALUES ($1) ON CONFLICT (\"a\") DO UPDATE SET \"a\" = EXCLUDED.\"a\""))
+    (is (= (query/insert-sql :t
+             {:a 1}
+             {:on-conflict {:target [:a] :do {:a [:+ :t.a [:excluded :a]]}} :returning :none})
+          [(str "INSERT INTO \"t\" (\"a\") VALUES ($1) ON CONFLICT (\"a\") "
+             "DO UPDATE SET \"a\" = (\"t\".\"a\" + EXCLUDED.\"a\")")
+            [1]])))
   (test "update-sql — SET params first, then WHERE"
-    (is (= (update-sql :users {:name "x"} [:= :id 5])
-          ["UPDATE users SET name = $1 WHERE id = $2 RETURNING *" ["x" 5]])))
+    (is (= (query/update-sql :users {:name "x"} [:= :id 5])
+          ["UPDATE \"users\" SET \"name\" = $1 WHERE \"id\" = $2 RETURNING *" ["x" 5]])))
+  (test "an update value may be an expression — an atomic increment"
+    (is (= (query/update-sql :releases {:downloads [:+ :downloads 1]} [:= :id 4] {:returning :none})
+          ["UPDATE \"releases\" SET \"downloads\" = (\"downloads\" + $1) WHERE \"id\" = $2" [1 4]])))
   (test "delete-sql"
-    (is (= (delete-sql :users [:= :id 5]) ["DELETE FROM users WHERE id = $1 RETURNING *" [5]]))))
+    (is (= (query/delete-sql :users [:= :id 5])
+          ["DELETE FROM \"users\" WHERE \"id\" = $1 RETURNING *" [5]]))))

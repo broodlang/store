@@ -4,12 +4,31 @@
   Open it with an *adaptor* (a contract map, e.g. from `store-postgres`'s `pg/adaptor`)
   and connection opts; run data queries through it. The adaptor performs the SQL I/O,
   so this library stays database-agnostic. `all`/`one` take a query map (see `query`)
-  and return rows as plain maps keyed by column name."
+  and return rows as plain maps keyed by column name.
+
+  A repo is either **pooled** (what `open` returns — each statement borrows any
+  connection) or **bound** to one connection (what `with-connection` and `transaction`
+  hand their function). Every function here takes either, so code written against a repo
+  runs unchanged inside a transaction.
+
+  The adaptor contract:
+
+    :start-pool      (opts) -> pool
+    :stop-pool       (pool) -> any
+    :exec            (pool sql params) -> rows
+    :with-connection (pool f) -> (f run), `run` being (sql params) -> rows on ONE connection
+    :columns         (pool table) -> [{:name :type}…]           ; optional, introspection
+    :lock-sql        {:acquire sql :release sql :transaction sql} ; optional, advisory locks
+
+  A failed statement raises the adaptor's error map. A constraint violation carries
+  `:violation` (`:unique` `:foreign-key` `:check` `:not-null` `:exclusion`) and
+  `:constraint` (its name), which is what `insert-changeset` maps to a field error."
   (:alias query)
   (:alias telemetry)
   (:alias seq)
   (:alias string)
-  (:alias schema))
+  (:alias schema)
+  (:alias changeset))
 
 (defn open (adaptor opts)
   "Open a repo over `adaptor` and connection `opts` (starts the adaptor's pool).
@@ -22,8 +41,8 @@
 
 ;; ---- running queries --------------------------------------------------------
 ;;
-;; Every query the repo runs — `all`, `one`, the writes, migrations, the transaction's
-;; inner repo — passes through `exec`, which makes it the one place to say that a query
+;; Every query the repo runs — `all`, `one`, the writes, migrations, a transaction's
+;; statements — passes through `exec`, which makes it the one place to say that a query
 ;; happened. It emits `[:store :query :stop]` (measurements `{:duration ms}`, metadata
 ;; `{:sql :op :source :params :rows}`) after each one and `[:store :query :exception]`
 ;; (`{:sql :op :source :params :error}`) when the adaptor raised, the way Ecto's repo
@@ -39,12 +58,14 @@
 
 (defn- shape-name (ws)
   "The first word of `ws` that is not a qualifier, with a trailing column list or `;`
-  stripped — `INSERT INTO t (a, b)` / `FROM t;` — or nil."
+  stripped and its identifier quotes removed — `INSERT INTO \"t\" (a, b)` / `FROM t;` —
+  or nil."
   (cond
     (empty? ws) nil
     (includes? shape-qualifiers (string/upper (first ws))) (shape-name (rest ws))
     :else
-      (let (name (first (string/split (first (string/split (first ws) "(")) ";")))
+      (let (name (string/replace (first (string/split (first (string/split (first ws) "(")) ";"))
+                   "\"" ""))
         (if (= name "") nil name))))
 
 (defn statement-shape (sql)
@@ -69,6 +90,12 @@
 (defn- elapsed-ms (started-ns)
   (/ (- (os/now-ns) started-ns) 1000000.0))
 
+(defn- run-statement (repo sql params)
+  (let (run (get repo :run))
+    (if (nil? run)
+      ((get (get repo :adaptor) :exec) (get repo :pool) sql params)
+      (run sql params))))
+
 (defn exec (repo sql params)
   "Run raw parameterized SQL (`$1`, `$2`, …) — the escape hatch. Returns the rows
   as maps keyed by column name (keywords); the adaptor handles the DB specifics.
@@ -76,7 +103,7 @@
   (let (started (os/now-ns)
         metadata (query-metadata sql params))
     (try
-      (let (rows ((get (get repo :adaptor) :exec) (get repo :pool) sql params))
+      (let (rows (run-statement repo sql params))
         (telemetry/emit [:store :query :stop]
           {:duration (elapsed-ms started)}
           (assoc metadata :rows (count rows)))
@@ -84,46 +111,127 @@
       (catch e
         (telemetry/emit [:store :query :exception]
           {:duration (elapsed-ms started)}
-          (assoc metadata :error (error-message e)))
+          (assoc metadata :error (if (map? e) (get e :message (pr-str e)) (error-message e))))
         (throw e)))))
+
+(defn- exec-compiled (repo compiled)
+  (exec repo (first compiled) (second compiled)))
 
 (defn all (repo q)
   "Run query `q` and return its rows as maps keyed by column name (keywords)."
-  (let (sp (query/to-sql q))
-    (exec repo (get sp 0) (get sp 1))))
+  (exec-compiled repo (query/to-sql q)))
 
 (defn one (repo q)
   "Run `q` with LIMIT 1; return the first row map, or nil if none."
   (first (all repo (query/limit q 1))))
 
+(defn- unordered (q)
+  (dissoc q :order :limit :offset))
+
+(defn aggregate (repo q op &optional column)
+  "One aggregate over the rows `q` selects: `(aggregate repo q :sum :bytes)`. `op` is
+  `:count` `:sum` `:max` `:min` or `:avg`; nil when no row contributes (except `:count`,
+  which is 0)."
+  (let (expr (if (nil? column) [op] [op column])
+        row (one repo (query/select (unordered q) [[:as expr :aggregate]])))
+    (get row :aggregate)))
+
+(defn count-rows (repo q)
+  "How many rows `q` selects."
+  (or (aggregate repo q :count) 0))
+
+(defn exists? (repo q)
+  "True when `q` selects at least one row."
+  (not (nil? (one repo (query/select (unordered q) [[:as [:raw "1"] :present]])))))
+
+(defn ping (repo)
+  "True when the database answers a trivial query; raises when it does not."
+  (exec repo "SELECT 1" [])
+  true)
+
 ;; ---- writes -----------------------------------------------------------------
+;; Each takes an optional `opts` map: `:returning` (`:all`, the default — RETURNING * —
+;; a vector of columns, or `:none`), and for an insert `:on-conflict` (see `query`).
 
-(defn insert (repo table row)
-  "Insert one `{:col value …}` row into `table`; return the inserted row map."
-  (let (sp (query/insert-sql table row))
-    (first (exec repo (get sp 0) (get sp 1)))))
+(defn insert (repo table row &optional (opts {}))
+  "Insert one `{:col value …}` row into `table`; return the row RETURNING gave back
+  (nil with `:returning :none`, or when `:on-conflict` did nothing)."
+  (first (exec-compiled repo (query/insert-sql table row opts))))
 
-(defn update (repo table changes where-expr)
-  "Set `changes` on rows of `table` matching `where-expr`; return the updated rows."
-  (let (sp (query/update-sql table changes where-expr))
-    (exec repo (get sp 0) (get sp 1))))
+(defn insert-all (repo table rows &optional (opts {}))
+  "Insert `rows` (each with the same columns) in one statement; return the rows given
+  back. An empty `rows` is no statement at all."
+  (if (empty? rows) [] (exec-compiled repo (query/insert-all-sql table rows opts))))
 
-(defn delete (repo table where-expr)
+(defn update (repo table changes where-expr &optional (opts {}))
+  "Set `changes` on rows of `table` matching `where-expr`; return the updated rows. A
+  change may be an expression: `{:downloads [:+ :downloads 1]}`."
+  (exec-compiled repo (query/update-sql table changes where-expr opts)))
+
+(defn delete (repo table where-expr &optional (opts {}))
   "Delete rows of `table` matching `where-expr`; return the deleted rows."
-  (let (sp (query/delete-sql table where-expr))
-    (exec repo (get sp 0) (get sp 1))))
+  (exec-compiled repo (query/delete-sql table where-expr opts)))
 
-;; ---- migrations (derived from a schema) -------------------------------------
+;; ---- changesets ---------------------------------------------------------------
 
-(defn create-table (repo schema-map)
+(defn- persist (cs action thunk)
+  "Run `thunk` for a valid changeset; an invalid one, or a constraint the changeset
+  declared, comes back as `[:error cs]` with its `:action` set."
+  (if (not (changeset/valid? cs))
+    [:error (changeset/with-action cs action)]
+    (let (outcome (try [:ok (thunk)] (catch e [:failed e])))
+      (if (= (first outcome) :ok)
+        outcome
+        (let (mapped (changeset/constraint-error cs (second outcome)))
+          (if (nil? mapped)
+            (throw (second outcome))
+            [:error (changeset/with-action mapped action)]))))))
+
+(defn- source-of (cs opts)
+  (or (get opts :table)
+    (changeset/source cs)
+    (error "repo: the changeset names no table — cast it with a schema or pass :table")))
+
+(defn insert-changeset (repo cs &optional (opts {}))
+  "Insert a changeset's data with its changes applied. `[:ok row]`, or `[:error cs]`
+  when it is invalid or a declared constraint (`changeset/unique-constraint` …) fails."
+  (persist cs
+    :insert (fn ()
+      (let (row (insert repo (source-of cs opts) (changeset/apply-changes cs) opts))
+        (if (nil? row) (changeset/apply-changes cs) row)))))
+
+(defn update-changeset (repo cs &optional (opts {}))
+  "Update the row a changeset was made from (found by its primary key) with its
+  changes. `[:ok row]` or `[:error cs]`; with no changes it is `[:ok data]` and no
+  statement."
+  (if (and (changeset/valid? cs) (empty? (changeset/changes cs)))
+    [:ok (changeset/data cs)]
+    (persist cs
+      :update (fn ()
+        (let (pk (changeset/primary-key cs)
+              key-value (get (changeset/data cs) pk)
+              _ (when (nil? key-value)
+                  (error "repo: update-changeset: the data has no " (pr-str pk) " to update by"))
+              rows (update repo
+                     (source-of cs opts)
+                     (changeset/changes cs)
+                     [:= pk key-value]
+                     opts))
+          (if (empty? rows)
+            (changeset/apply-changes cs)
+            (merge (changeset/data cs) (first rows))))))))
+
+;; ---- DDL conveniences ----------------------------------------------------------
+;; A real schema change is a migration (see `migration`); these are for a test's
+;; throwaway tables.
+
+(defn create-table (repo schema-map &optional (opts {}))
   "Create the table described by `schema-map` (see the `schema` module)."
-  (exec repo (schema/create-table-sql schema-map) []))
+  (exec repo (schema/create-table-sql schema-map opts) []))
 
-(defn drop-table (repo schema-map)
-  "Drop the table described by `schema-map` (IF EXISTS)."
-  (exec repo (schema/drop-table-sql schema-map) []))
-
-;; ---- migration diffing (reconcile a live table with a schema) ----------------
+(defn drop-table (repo schema-map &optional (opts {:if-exists true}))
+  "Drop the table described by `schema-map` (IF EXISTS unless `opts` say otherwise)."
+  (exec repo (schema/drop-table-sql schema-map opts) []))
 
 (defn columns (repo table)
   "The live column names (keywords) of `table`, via the adaptor's introspection.
@@ -131,37 +239,6 @@
   (map ((get (get repo :adaptor) :columns) (get repo :pool)
          (->string (if (map? table) (get table :table) table)))
     (fn (c) (keyword (get c :name)))))
-
-(defn diff (repo schema-map)
-  "Compare `schema-map`'s :fields to the live table; return the migration as data:
-  `{:create true}` if the table is absent, else `{:add [field…] :drop [col…]}`
-  (fields to ADD, live columns to DROP — both possibly empty)."
-  (let (have (columns repo schema-map))
-    (if (empty? have)
-      {:create true}
-      (let (want (keys (get schema-map :fields))
-            have-set (reduce have {} (fn (m c) (assoc m c true)))
-            want-set (reduce want {} (fn (m c) (assoc m c true))))
-        {:add (into [] (seq/filter want (fn (f) (nil? (get have-set f)))))
-         :drop (into [] (seq/filter have (fn (c) (nil? (get want-set c)))))}))))
-
-(defn migrate (repo schema-map & opts)
-  "Reconcile the live table with `schema-map`. Creates it if absent; otherwise ADDs
-  any new fields. Pass `{:drop true}` to also DROP columns no longer in the schema
-  (off by default — it loses data). Returns the SQL statements run."
-  (let (o (if (empty? opts) {} (first opts))
-        d (diff repo schema-map)
-        table (get schema-map :table)
-        fields (get schema-map :fields))
-    (if (get d :create)
-      (do (create-table repo schema-map) [(schema/create-table-sql schema-map)])
-      (let (adds (map (get d :add) (fn (f) (schema/add-column-sql table f (get fields f))))
-            drops (if (get o :drop)
-                    (map (get d :drop) (fn (c) (schema/drop-column-sql table c)))
-                    [])
-            stmts (append adds drops))
-        (reduce stmts nil (fn (_ s) (exec repo s [])))
-        stmts))))
 
 ;; ---- associations / preloads ------------------------------------------------
 ;; A schema's :associations describes related tables, e.g.
@@ -279,14 +356,77 @@
     (fn? s) (s)
     else s))
 
-;; ---- transactions -----------------------------------------------------------
+;; ---- connections and transactions ---------------------------------------------
+
+(defn bound? (repo)
+  "True when `repo` is bound to one connection (inside `with-connection`/`transaction`)."
+  (not (nil? (get repo :run))))
+
+(defn with-connection (repo f)
+  "Run `(f conn)` with `conn` a repo bound to ONE checked-out connection, returned to the
+  pool afterwards — for work that must share a session (an advisory lock, a temporary
+  table). Already bound, `f` gets `repo` itself."
+  (if (bound? repo)
+    (f repo)
+    (let (adaptor (get repo :adaptor)
+          checkout (get adaptor :with-connection))
+      (when (nil? checkout) (error "repo: this adaptor has no :with-connection"))
+      (checkout (get repo :pool) (fn (run) (f (assoc repo :run run :depth 0)))))))
+
+(defn- finish (conn statement)
+  "Run a ROLLBACK-type `statement`, swallowing its own failure: the original error is the
+  one worth raising, and a dead connection cannot roll back anyway (the server does)."
+  (check-allow :discarded-catch (try (exec conn statement []) (catch _ nil))))
 
 (defn transaction (repo f)
-  "Run `(f tx)` inside a database transaction. `tx` is a repo bound to the
-  transaction's single connection — use the same `all`/`one`/`insert`/`update`/
-  `delete`/`exec` on it. Commits if `f` returns; rolls back and re-raises if `f`
-  throws. Returns `f`'s value. (Adaptor-dependent: store-postgres is fully
-  transactional; an adaptor that can't support it raises.)"
-  ((get (get repo :adaptor) :transaction) (get repo :pool)
-    (fn (tx-exec)
-      (f {:adaptor {:exec (fn (_ sql params) (tx-exec sql params))} :pool nil}))))
+  "Run `(f tx)` inside a database transaction. `tx` is a repo bound to the transaction's
+  connection — use the same `all`/`one`/`insert`/`update`/`delete`/`exec` on it. Commits
+  if `f` returns; rolls back and re-raises if it throws. Returns `f`'s value.
+
+  Nested — `transaction` on a `tx` — is a SAVEPOINT: an inner failure rolls back only the
+  inner work, and the outer transaction carries on if the caller catches it."
+  (with-connection repo
+    (fn (conn)
+      (let (depth (get conn :depth 0)
+            inner (assoc conn :depth (inc depth))
+            savepoint (str "store_savepoint_" depth))
+        (exec conn (if (= depth 0) "BEGIN" (str "SAVEPOINT " savepoint)) [])
+        (let (outcome (try [:ok (f inner)] (catch e [:failed e])))
+          (if (= (first outcome) :ok)
+            (do
+              (exec conn (if (= depth 0) "COMMIT" (str "RELEASE SAVEPOINT " savepoint)) [])
+              (second outcome))
+            (do
+              (finish conn (if (= depth 0) "ROLLBACK" (str "ROLLBACK TO SAVEPOINT " savepoint)))
+              (throw (second outcome)))))))))
+
+;; ---- advisory locks -------------------------------------------------------------
+;; A lock named by an integer `key`, held by the database rather than by any row — what
+;; keeps two machines from running the same migrations at once. An adaptor without
+;; `:lock-sql` takes no lock (a single-process database needs none).
+
+(defn- lock-sql (repo kind)
+  (get (get (get repo :adaptor) :lock-sql) kind))
+
+(defn with-lock (repo key f)
+  "Run `(f conn)` holding the session advisory lock `key`, waiting for it if another
+  session holds it. Released afterwards, however `f` ends (and by the database, if the
+  connection dies)."
+  (with-connection repo
+    (fn (conn)
+      (let (acquire (lock-sql conn :acquire))
+        (if (nil? acquire)
+          (f conn)
+          (do
+            (exec conn acquire [key])
+            (let (outcome (try [:ok (f conn)] (catch e [:failed e])))
+              (finish conn (lock-sql conn :release))
+              (if (= (first outcome) :ok) (second outcome) (throw (second outcome))))))))))
+
+(defn transaction-lock (tx key)
+  "Take the advisory lock `key` until `tx`'s transaction ends — serialising writers to
+  one resource (a project's pointer log) without locking a row."
+  (when (nil? (get tx :run)) (error "repo: transaction-lock needs a transaction's repo"))
+  (let (sql (lock-sql tx :transaction))
+    (when sql (exec tx sql [key]))
+    nil))

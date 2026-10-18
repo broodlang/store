@@ -1,65 +1,430 @@
 (defmodule changeset
-  "Changesets — validate and shape untrusted input *before* it touches the database,
-  kept separate from the schema (Ecto's best idea, minus the ceremony). A changeset
-  is a plain map threaded through ordinary functions:
+  "Changesets — cast and validate untrusted input *before* it touches the database,
+  kept separate from the schema (Ecto's best idea, minus the ceremony). A changeset is
+  a plain map threaded through ordinary functions:
 
-    (-> (change params)
-        (permit [:name :email :age])       ; allowlist the fields to take from params
-        (validate-required [:name :email]) ; must be present and non-blank
-        (validate :age (fn (a) (>= a 0)) \"must be non-negative\"))
+    (-> (cast user params [:email :age] users-schema) ; take, and convert, the allowed fields
+        (validate-required [:email])
+        (validate-format :email \"^[^@\\\\s]+@[^@\\\\s]+$\")
+        (validate-number :age {:greater-than-or-equal-to 0})
+        (unique-constraint :email {:name \"users_email_idx\"}))
 
-  Then `(valid? cs)` / `(errors cs)` / `(changes cs)`. For an update, seed with the
-  existing record: `(change record params)`; `(apply-changes cs)` is the merged
-  result. No macros, no DB — `unique`-style checks that need the database live on
-  the repo.")
+  then `(repo/insert-changeset repo cs)` / `(repo/update-changeset repo cs)` give
+  `[:ok row]` or `[:error cs]` — a declared constraint the database rejects comes back
+  as a field error rather than an exception.
 
-(defn change (& args)
-  "Start a changeset. `(change params)` for an insert; `(change record params)` for
-  an update (record is the existing row)."
-  (if (= (count args) 1)
-    {:data {} :params (first args) :changes {} :errors [] :valid? true}
-    {:data (first args) :params (second args) :changes {} :errors [] :valid? true}))
+  **Casting.** `params` arrive as the client sent them (string keys, string values);
+  `cast` takes only the `permitted` fields — the mass-assignment guard — and converts
+  each to the type the schema (or a plain `{field type}` map) declares: `\"42\"` becomes
+  `42`, `\"on\"` becomes `true`, and a value that will not convert is the error \"is
+  invalid\". A blank string is nil. A value equal to the data's is not a change, so an
+  update writes only what moved.
 
-(defn permit (cs fields)
-  "Copy each of the allowed `fields` from params into changes — but only those
-  actually present in params (so a partial update touches only what was sent). This
-  is the allowlist that stops mass-assignment."
-  (let (params (get cs :params))
-    (assoc cs
-      :changes
-        (reduce fields
-          (get cs :changes)
-          (fn (acc f) (if (contains? params f) (assoc acc f (get params f)) acc))))))
+  **Validations** run on the *changes* (an update does not re-judge a field it leaves
+  alone), except `validate-required`, which asks whether the field has a value at all —
+  changed or already there. Messages carry `%{key}` holes filled from the error's
+  metadata by `error-messages`.
+
+  A changeset without a schema works too — `(cast {} params [:password :confirmation]
+  {:password :text :confirmation :text})` validates a form that is never stored, and
+  `apply-action` gives `[:ok data]` or `[:error cs]` for it."
+  (:alias regex))
+
+(defn changeset? (x)
+  "True when `x` is a changeset."
+  (and (map? x) (= (get x :changeset?) true)))
+
+(defn- empty-changeset (data)
+  {:changeset? true
+   :data data
+   :params {}
+   :changes {}
+   :errors []
+   :valid? true
+   :types {}
+   :source nil
+   :primary-key :id
+   :constraints []
+   :action nil})
+
+(defn- from (data)
+  (if (changeset? data) data (empty-changeset (or data {}))))
+
+;; ---- types ---------------------------------------------------------------------
+
+(defn- types-of (types-or-schema)
+  "The `{field type}` map from a schema (its `:fields`, long or short form) or from a
+  plain types map."
+  (cond
+    (nil? types-or-schema) {}
+    (contains? types-or-schema :fields)
+      (let (fields (get types-or-schema :fields))
+        (reduce (keys fields)
+          {}
+          (fn (acc f)
+            (let (spec (get fields f))
+              (assoc acc
+                f
+                  (cond
+                    (map? spec) (get spec :type)
+                    (vector? spec) (first spec)
+                    :else spec))))))
+    :else types-or-schema))
+
+(defn- blank? (v)
+  (and (string? v) (= (string/trim v) "")))
+
+(def- integer-types #{:integer :int :bigint :serial :bigserial :smallint})
+
+(defn- parse-number (s)
+  (let (n (string/->number (string/trim s)))
+    (if (number? n) n nil)))
+
+(defn cast-value (type v)
+  "`v` converted to `type`: `[:ok value]`, or `:error` when it will not convert. A
+  type outside the vocabulary passes the value through."
+  (cond
+    (nil? v) [:ok nil]
+    (contains? integer-types type)
+      (cond
+        (int? v) [:ok v]
+        (string? v) (let (n (parse-number v)) (if (int? n) [:ok n] :error))
+        :else :error)
+    (or (= type :float) (= type :real))
+      (cond
+        (int? v) [:ok (* 1.0 v)]
+        (float? v) [:ok v]
+        (string? v) (let (n (parse-number v)) (if (nil? n) :error [:ok (* 1.0 n)]))
+        :else :error)
+    (or (= type :numeric) (= type :decimal))
+      (cond
+        (decimal? v) [:ok v]
+        (int? v) [:ok (decimal/of (str v))]
+        (string? v)
+          (check-allow :discarded-catch
+            (try [:ok (decimal/of (string/trim v))] (catch _ :error)))
+        :else :error)
+    (or (= type :boolean) (= type :bool))
+      (cond
+        (bool? v) [:ok v]
+        (not (string? v)) :error
+        (includes? ["true" "1" "on" "yes"] (string/lower v)) [:ok true]
+        (includes? ["false" "0" "off" "no"] (string/lower v)) [:ok false]
+        :else :error)
+    (or (= type :text) (= type :string)) (if (string? v) [:ok v] :error)
+    :else [:ok v]))
+
+;; ---- building ------------------------------------------------------------------
+
+(defn- param-value (params field)
+  "The param for `field`, sent under the keyword or under its string name; `[:absent]`
+  when it was not sent at all (which is not the same as sent empty)."
+  (cond
+    (contains? params field) [:present (get params field)]
+    (contains? params (->string field)) [:present (get params (->string field))]
+    :else [:absent]))
 
 (defn put-change (cs field value)
-  "Force a change programmatically (e.g. a derived/defaulted field)."
+  "Set `field` to `value` programmatically — a derived or defaulted field. Equal to the
+  data's value, it is no change (and removes a pending one)."
+  (if (= value (get (get cs :data) field))
+    (assoc cs :changes (dissoc (get cs :changes) field))
+    (assoc cs :changes (assoc (get cs :changes) field value))))
+
+(defn force-change (cs field value)
+  "Set `field` to `value` even when the data already holds it."
   (assoc cs :changes (assoc (get cs :changes) field value)))
 
-(defn add-error (cs field message)
-  "Record an error on `field` and mark the changeset invalid."
+(defn delete-change (cs field)
+  "Drop any pending change to `field`."
+  (assoc cs :changes (dissoc (get cs :changes) field)))
+
+(defn add-error (cs field message &optional (meta {}))
+  "Record an error on `field` and mark the changeset invalid. `meta` fills the
+  message's `%{key}` holes."
   (assoc cs
-    :errors (into (get cs :errors) [[field message]])
+    :errors (conj (get cs :errors) [field message meta])
     :valid? false))
 
-(defn validate-required (cs fields)
-  "Each of `fields` must be present in changes and non-nil / non-blank."
-  (reduce fields
-    cs
-    (fn (c f)
-      (let (v (get (get c :changes) f))
-        (if (or (nil? v) (= v "")) (add-error c f "is required") c)))))
+(defn change (data &optional (changes {}))
+  "A changeset over `data` (a row, or `{}` for an insert) with `changes` applied as
+  they are — no casting, no allowlist. For trusted, programmatic changes."
+  (reduce (keys changes) (from data) (fn (cs f) (put-change cs f (get changes f)))))
 
-(defn validate (cs field pred message)
-  "If `field` is set in changes and `(pred value)` is false, add `message`."
-  (let (v (get (get cs :changes) field))
-    (if (and (not (nil? v)) (not (pred v))) (add-error cs field message) cs)))
+(defn cast (data params permitted &optional types-or-schema)
+  "A changeset taking the `permitted` fields from `params` and converting each to its
+  type. `types-or-schema` is a schema map (which also names the table and primary key
+  `repo/insert-changeset` writes to) or a plain `{field type}` map; without it values
+  are taken as sent. `data` may be a changeset, to cast in more fields."
+  (let (base (from data)
+        types (merge (get base :types) (types-of types-or-schema))
+        schema-given? (and (not (nil? types-or-schema)) (contains? types-or-schema :table))
+        start (assoc base
+                :params (merge (get base :params) (or params {}))
+                :types types
+                :source (if schema-given? (get types-or-schema :table) (get base :source))
+                :primary-key
+                  (if schema-given?
+                    (get types-or-schema :primary-key :id)
+                    (get base :primary-key)))
+        incoming (or params {}))
+    (reduce permitted
+      start
+      (fn (cs field)
+        (match (param-value incoming field)
+          ([:absent] cs)
+          ([:present raw] (let (value (if (blank? raw) nil raw)
+                                converted (if (contains? types field)
+                                            (cast-value (get types field) value)
+                                            [:ok value]))
+                            (if (= converted :error)
+                              (add-error cs
+                                field
+                                "is invalid"
+                                {:validation :cast :type (get types field)})
+                              (put-change cs field (second converted))))))))))
 
-;; ---- accessors --------------------------------------------------------------
+;; ---- reading -------------------------------------------------------------------
 
-(defn valid? (cs) (get cs :valid?))
-(defn errors (cs) (get cs :errors))
-(defn changes (cs) (get cs :changes))
+(defn valid? (cs) "True when no error has been added." (get cs :valid?))
+(defn errors (cs)
+  "The errors as `[field message meta]` triples, in the order added."
+  (get cs :errors))
+(defn changes (cs) "The pending `{field value}` changes." (get cs :changes))
+(defn data (cs) "The data the changeset started from." (get cs :data))
+(defn params (cs) "The params it was cast from." (get cs :params))
+(defn source (cs) "The table it writes to, when it was cast with a schema." (get cs :source))
+(defn primary-key (cs)
+  "The primary key `repo/update-changeset` finds the row by."
+  (get cs :primary-key))
+(defn action (cs)
+  "The action that last failed with it (`:insert`, `:update`, …), or nil."
+  (get cs :action))
+
+(defn with-action (cs action)
+  "`cs` marked as having been attempted as `action`."
+  (assoc cs :action action))
+
+(defn get-change (cs field &optional default)
+  "The pending change to `field`, else `default`."
+  (get (get cs :changes) field default))
+
+(defn changed? (cs field)
+  "True when `field` has a pending change."
+  (contains? (get cs :changes) field))
+
+(defn get-field (cs field &optional default)
+  "`field`'s value as it would be saved: the change, else the data's, else `default`."
+  (cond
+    (contains? (get cs :changes) field) (get (get cs :changes) field)
+    (contains? (get cs :data) field) (get (get cs :data) field)
+    :else default))
 
 (defn apply-changes (cs)
-  "The resulting record: the seed data with the changes applied."
+  "The resulting record: the data with the changes applied."
   (merge (get cs :data) (get cs :changes)))
+
+(defn apply-action (cs action)
+  "`[:ok record]` for a valid changeset, else `[:error cs]` marked with `action` — for
+  a form that is validated but not stored."
+  (if (valid? cs) [:ok (apply-changes cs)] [:error (with-action cs action)]))
+
+(defn- interpolate (message meta)
+  (reduce (keys meta)
+    message
+    (fn (text k) (string/replace text (str "%{" (->string k) "}") (str (get meta k))))))
+
+(defn error-messages (cs)
+  "`{field [message …]}` with each message's `%{key}` holes filled."
+  (reduce (errors cs)
+    {}
+    (fn (acc entry)
+      (let ([field message meta] entry)
+        (assoc acc field (conj (get acc field []) (interpolate message meta)))))))
+
+(defn error-for (cs field)
+  "`field`'s first error message, or nil."
+  (first (get (error-messages cs) field)))
+
+;; ---- validations ---------------------------------------------------------------
+
+(defn- has-error? (cs field)
+  (any? (errors cs) (fn (entry) (= (first entry) field))))
+
+(defn- validate-changed (cs field check)
+  "Run `(check value)` on `field`'s pending change — skipped when there is none, when it
+  is nil, or when the field already failed to cast. `check` returns nil or
+  `[message meta]`."
+  (let (value (get-change cs field))
+    (if (or (nil? value) (has-error? cs field))
+      cs
+      (let (failure (check value))
+        (if (nil? failure) cs (add-error cs field (first failure) (second failure)))))))
+
+(defn validate-required (cs fields &optional (opts {}))
+  "Each of `fields` must have a value — changed or already in the data — that is not
+  nil or blank. A field that failed to cast is not reported twice."
+  (reduce fields
+    cs
+    (fn (c field)
+      (let (value (get-field c field))
+        (if (and (or (nil? value) (blank? value)) (not (has-error? c field)))
+          (add-error c field (get opts :message "can't be blank") {:validation :required})
+          c)))))
+
+(defn- size-of (v)
+  (if (string? v) (string/length v) (count v)))
+
+(defn validate-length (cs field opts)
+  "A string's length (in characters) or a collection's count must satisfy `opts`:
+  `:is`, `:min`, `:max`."
+  (validate-changed cs
+    field
+    (fn (v)
+      (let (n (size-of v)
+            unit (if (string? v) "character(s)" "item(s)"))
+        (cond
+          (and (contains? opts :is) (not (= n (get opts :is))))
+            [(get opts :message (str "should be %{count} " unit))
+              {:validation :length :kind :is :count (get opts :is)}]
+          (and (contains? opts :min) (< n (get opts :min)))
+            [(get opts :message (str "should be at least %{count} " unit))
+              {:validation :length :kind :min :count (get opts :min)}]
+          (and (contains? opts :max) (> n (get opts :max)))
+            [(get opts :message (str "should be at most %{count} " unit))
+              {:validation :length :kind :max :count (get opts :max)}]
+          :else nil)))))
+
+(def- number-checks
+  [[:less-than < "must be less than %{number}"]
+    [:greater-than > "must be greater than %{number}"]
+    [:less-than-or-equal-to <= "must be less than or equal to %{number}"]
+    [:greater-than-or-equal-to >= "must be greater than or equal to %{number}"]
+    [:equal-to = "must be equal to %{number}"]])
+
+(defn validate-number (cs field opts)
+  "A number must satisfy each bound in `opts`: `:less-than` `:greater-than`
+  `:less-than-or-equal-to` `:greater-than-or-equal-to` `:equal-to`."
+  (validate-changed cs
+    field
+    (fn (v)
+      (fold number-checks
+        nil
+        (fn (failure check)
+          (let ([kind holds? message] check)
+            (if (or (not (nil? failure)) (not (contains? opts kind)) (holds? v (get opts kind)))
+              failure
+              [(get opts :message message) {:validation :number :kind kind :number (get opts kind)}])))))))
+
+(defn validate-format (cs field pattern &optional (opts {}))
+  "A string must match the regex `pattern` somewhere (anchor it to match the whole)."
+  (validate-changed cs
+    field
+    (fn (v)
+      (if (regex/find pattern v)
+        nil
+        [(get opts :message "has invalid format") {:validation :format}]))))
+
+(defn validate-inclusion (cs field values &optional (opts {}))
+  "The value must be one of `values`."
+  (validate-changed cs
+    field
+    (fn (v)
+      (if (includes? values v) nil [(get opts :message "is invalid") {:validation :inclusion}]))))
+
+(defn validate-exclusion (cs field values &optional (opts {}))
+  "The value must not be one of `values`."
+  (validate-changed cs
+    field
+    (fn (v)
+      (if (includes? values v) [(get opts :message "is reserved") {:validation :exclusion}] nil))))
+
+(defn validate-confirmation (cs field &optional (opts {}))
+  "The param `<field>_confirmation` (or `:confirmation` in `opts`) must equal the
+  field's change; the error lands on the confirmation field, which is where a form shows
+  it."
+  (let (confirmation (get opts :confirmation (keyword (str (->string field) "_confirmation")))
+        value (get-change cs field))
+    (if (nil? value)
+      cs
+      (match (param-value (params cs) confirmation)
+        ([:present given] (if (= given value)
+                            cs
+                            (add-error cs
+                              confirmation
+                              (get opts :message "does not match confirmation")
+                              {:validation :confirmation})))
+        ([:absent] (if (get opts :required)
+                     (add-error cs confirmation "can't be blank" {:validation :required})
+                     cs))))))
+
+(defn validate-acceptance (cs field &optional (opts {}))
+  "The param `field` must be sent as true (a ticked checkbox: `on`/`true`/`1`)."
+  (match (param-value (params cs) field)
+    ([:present v] (if (= (cast-value :boolean v) [:ok true])
+                    cs
+                    (add-error cs
+                      field
+                      (get opts :message "must be accepted")
+                      {:validation :acceptance})))
+    ([:absent] (add-error cs field (get opts :message "must be accepted") {:validation :acceptance}))))
+
+(defn validate-change (cs field check)
+  "Run `(check value)` on `field`'s change: it returns nil, a message, or a vector of
+  messages — the hook for a rule the built-ins do not cover."
+  (validate-changed cs
+    field
+    (fn (v)
+      (let (outcome (check v))
+        (cond
+          (nil? outcome) nil
+          (string? outcome) [outcome {:validation :custom}]
+          (empty? outcome) nil
+          :else [(first outcome) {:validation :custom}])))))
+
+(defn validate (cs field pred message)
+  "If `field` has a change and `(pred value)` is false, add `message`."
+  (validate-changed cs field (fn (v) (if (pred v) nil [message {:validation :custom}]))))
+
+;; ---- constraints ---------------------------------------------------------------
+;; The database is the only place a uniqueness or a reference can be guaranteed: two
+;; requests can both pass an application-level check. A declared constraint turns the
+;; database's rejection into a field error on the way out of `repo/insert-changeset`.
+
+(defn- add-constraint (cs type field opts default-message)
+  (let (name (or (get opts :name)
+               (when (source cs) (str (->string (source cs)) "_" (->string field) "_index"))
+               (error "changeset: name the constraint on "
+                 (pr-str field)
+                 " — there is no :source to derive it from")))
+    (assoc cs
+      :constraints
+        (conj (get cs :constraints)
+          {:type type :name name :field field :message (get opts :message default-message)}))))
+
+(defn unique-constraint (cs field &optional (opts {}))
+  "Report a unique-index violation named `:name` (default `<table>_<field>_index`) as
+  \"has already been taken\" on `field`."
+  (add-constraint cs :unique field opts "has already been taken"))
+
+(defn foreign-key-constraint (cs field &optional (opts {}))
+  "Report a foreign-key violation named `:name` as \"does not exist\" on `field`."
+  (add-constraint cs :foreign-key field opts "does not exist"))
+
+(defn check-constraint (cs field opts)
+  "Report the check constraint `:name` (required) as \"is invalid\" on `field`."
+  (add-constraint cs :check field opts "is invalid"))
+
+(defn constraint-error (cs error)
+  "`cs` with the field error for a database `error` it declared a constraint for, or
+  nil when it declared none — the caller then re-raises."
+  (let (violation (when (map? error) (get error :violation))
+        name (when (map? error) (get error :constraint))
+        declared (when violation
+                   (first (seq/filter (get cs :constraints)
+                            (fn (c) (and (= (get c :type) violation) (= (get c :name) name)))))))
+    (when declared
+      (add-error cs
+        (get declared :field)
+        (get declared :message)
+        {:constraint violation :constraint-name name}))))
