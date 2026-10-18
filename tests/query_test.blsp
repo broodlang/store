@@ -106,6 +106,9 @@
           "SELECT * FROM \"p\" WHERE \"name\" LIKE 'change/%'"))))
 
 (describe "query: DML"
+  (test "a row that sets no column takes every default"
+    (is (= (query/insert-sql :users {}) ["INSERT INTO \"users\" DEFAULT VALUES RETURNING *" []]))
+    (assert-error (query/insert-all-sql :users [{} {}])))
   (test "insert-sql (single column → deterministic)"
     (is (= (query/insert-sql :users {:name "ada"})
           ["INSERT INTO \"users\" (\"name\") VALUES ($1) RETURNING *" ["ada"]])))

@@ -126,3 +126,42 @@
                       :name [:text {:null false :default "x"}]
                       :owner [:integer {:references :users}]}}))
       (is (= (migration/check [] []) [])))))
+
+(describe "migration: constraints"
+  (def- orgs
+    {:table :orgs
+     :primary-key :id
+     :fields {:id :serial :name :text :user_id :integer}
+     :constraints [{:unique [:name]} {:check [:<> [:is-nil :name] [:is-nil :user_id]]}]})
+
+  (test "a table's constraints are in the model, and check sees them"
+    (let (created (migration/generate [] [orgs] "orgs" 1))
+      (is (= (migration/check [created] [orgs]) []))
+      (is (= (get (get (migration/model [created]) :orgs) :constraints)
+            {"orgs_name_key" {:name "orgs_name_key" :unique [:name]}
+             "orgs_check" {:name "orgs_check" :check [:<> [:is-nil :name] [:is-nil :user_id]]}}))))
+
+  (test "a constraint added or dropped is a step, and each reverses"
+    (let (created (migration/generate [] [(dissoc orgs :constraints)] "orgs" 1)
+          steps (migration/check [created] [orgs]))
+      (is (= steps
+            [[:add-constraint
+               :orgs {:name "orgs_check" :check [:<> [:is-nil :name] [:is-nil :user_id]]}]
+              [:add-constraint :orgs {:name "orgs_name_key" :unique [:name]}]]))
+      (is (= (migration/check [created {:version 2 :name "c" :up steps}] [orgs]) []))
+      (is (= (migration/reverse-step (first steps)) [:drop-constraint :orgs (nth (first steps) 2)]))
+      (is (= (migration/reverse-step [:drop-constraint :orgs (nth (first steps) 2)]) (first steps)))
+      (is (nil? (migration/reverse-step [:drop-constraint :orgs "orgs_check"])))
+      (is (= (migration/check [created {:version 2 :name "c" :up steps}]
+               [(dissoc orgs :constraints)])
+            [[:drop-constraint
+               :orgs {:name "orgs_check" :check [:<> [:is-nil :name] [:is-nil :user_id]]}]
+              [:drop-constraint :orgs {:name "orgs_name_key" :unique [:name]}]]))))
+
+  (test "step-sql, and a rename carries a unique constraint's column"
+    (is (= (migration/step-sql [:drop-constraint :orgs {:unique [:name]} {:if-exists true}])
+          ["ALTER TABLE \"orgs\" DROP CONSTRAINT IF EXISTS \"orgs_name_key\""]))
+    (let (model (migration/model [(migration/generate [] [orgs] "orgs" 1)
+                                   {:version 2 :name "r" :up [[:rename-column :orgs :name :title]]}]))
+      (is (= (get (get (get model :orgs) :constraints) "orgs_name_key")
+            {:name "orgs_name_key" :unique [:title]})))))

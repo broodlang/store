@@ -67,6 +67,11 @@ app's schemas, and `migration/generate` writes the one that closes a gap:
 (migration/check all [users-schema])     ; → [] when they agree
 ```
 
+A schema's table constraints are data too — `:constraints [{:unique [:name]} {:check
+[:<> [:is-nil :name] [:is-nil :user_id]]}]`, named the way Postgres names them
+(`<table>_name_key`, `<table>_check`) — and `:add-constraint` / `:drop-constraint` change
+them in a migration.
+
 Add it to a project with:
 
 ```bash

@@ -8,12 +8,16 @@
               :role [:text {:null false :default \"member\"}]
               :organisation_id [:integer {:references {:table :organisations :on-delete :cascade}}]}
      :indexes [{:columns [:email] :unique true :name \"users_email_idx\"}
-               {:columns [:role] :where [:not-nil :role]}]}
+               {:columns [:role] :where [:not-nil :role]}]
+     :constraints [{:unique [:organisation_id :email]}
+                   {:name \"users_role_check\" :check [:in :role [\"member\" \"admin\"]]}]}
 
   A field is a type keyword, or `[type opts]` with `:null` (false = NOT NULL),
   `:default` (a literal, or `[:raw \"now()\"]`) and `:references` (a table keyword, or
   `{:table :column :on-delete :on-update}`). An index is `{:columns :unique :name :where}`;
-  its name defaults to `<table>_<columns>_index`. A changeset casts against the same
+  its name defaults to `<table>_<columns>_index`. A table constraint is `{:unique [cols]}`
+  or `{:check expr}` (a query expression), with a `:name` defaulting to the one Postgres
+  gives — `<table>_<columns>_key`, `<table>_check`. A changeset casts against the same
   `:fields` (see `changeset/cast`), and `migration/check` proves the migrations build it.
 
   Field types are an abstract vocabulary mapped to SQL: :integer :bigint :serial
@@ -134,13 +138,17 @@
         pk (primary-key-columns (get s :primary-key))
         pk-sql (if (empty? pk)
                  ""
-                 (str ", PRIMARY KEY (" (string/join (map pk query/ident) ", ") ")")))
+                 (str ", PRIMARY KEY (" (string/join (map pk query/ident) ", ") ")"))
+        constraints-sql (string/join (map (constraints s)
+                                       (fn (c) (str ", " (constraint-sql (get s :table) c))))
+                          ""))
     (str "CREATE TABLE "
       (if (get opts :if-not-exists) "IF NOT EXISTS " "")
       (query/ident (get s :table))
       " ("
       (string/join columns ", ")
       pk-sql
+      constraints-sql
       ")")))
 
 (defn- table-name (s) (if (map? s) (get s :table) s))
@@ -236,5 +244,46 @@
   "`DROP INDEX`. `opts`: `:concurrently`, `:if-exists`."
   (str "DROP INDEX "
     (if (get opts :concurrently) "CONCURRENTLY " "")
+    (if (get opts :if-exists) "IF EXISTS " "")
+    (query/ident name)))
+
+;; ---- constraints ---------------------------------------------------------------
+
+(defn constraint-name (table c)
+  "The default name of table constraint `c` — the one Postgres itself gives: `<table>_<columns>_key`
+  for a unique constraint, `<table>_check` for a check."
+  (if (get c :unique)
+    (str (->string table) "_" (string/join (map (get c :unique) ->string) "_") "_key")
+    (str (->string table) "_check")))
+
+(defn constraint-spec (table c)
+  "A table constraint with its `:name` filled in."
+  (when (not (or (get c :unique) (get c :check)))
+    (error "schema: a constraint needs :unique columns or a :check expression: " (pr-str c)))
+  (assoc c :name (or (get c :name) (constraint-name table c))))
+
+(defn constraints (s)
+  "`s`'s table constraints, each with its name."
+  (map (or (get s :constraints) []) (fn (c) (constraint-spec (get s :table) c))))
+
+(defn constraint-sql (table c)
+  "One table constraint's definition: `CONSTRAINT name UNIQUE (…)` or `CONSTRAINT name CHECK (…)`,
+  the check a query expression with its values inlined."
+  (let (spec (constraint-spec table c))
+    (str "CONSTRAINT "
+      (query/ident (get spec :name))
+      (if (get spec :unique)
+        (str " UNIQUE (" (string/join (map (get spec :unique) query/ident) ", ") ")")
+        (str " CHECK (" (inline-expr (get spec :check)) ")")))))
+
+(defn add-constraint-sql (table c)
+  "`ALTER TABLE … ADD CONSTRAINT`."
+  (str "ALTER TABLE " (query/ident table) " ADD " (constraint-sql table c)))
+
+(defn drop-constraint-sql (table name &optional (opts {}))
+  "`ALTER TABLE … DROP CONSTRAINT`. `opts`: `:if-exists`."
+  (str "ALTER TABLE "
+    (query/ident table)
+    " DROP CONSTRAINT "
     (if (get opts :if-exists) "IF EXISTS " "")
     (query/ident name)))

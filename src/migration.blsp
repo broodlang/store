@@ -13,7 +13,7 @@
   An app keeps its migrations as a vector in one module and passes it to `migrate`.
   The steps:
 
-    [:create-table table {:fields {…} :primary-key k :if-not-exists bool}]
+    [:create-table table {:fields {…} :primary-key k :constraints […] :if-not-exists bool}]
     [:drop-table table definition?]            ; the definition makes it reversible
     [:rename-table from to]
     [:add-column table field spec opts?]       ; opts: :if-not-exists
@@ -22,10 +22,12 @@
     [:alter-column table field {:type :null :default :using :from {…}}]
     [:create-index table {:columns :unique :name :where} opts?]  ; :concurrently :if-not-exists
     [:drop-index table index opts?]            ; index: a name, or the spec (reversible)
+    [:add-constraint table {:unique [cols] | :check expr, :name}]
+    [:drop-constraint table constraint opts?]  ; a name, or the spec (reversible); :if-exists
     [:execute up-sql down-sql?]                ; the escape hatch, e.g. a backfill
     [:run up-fn down-fn?]                      ; (fn (repo) …) — a data migration in code
 
-  Field specs and indexes are the `schema` module's. A migration's `:down` is written
+  Field specs, indexes and constraints are the `schema` module's. A migration's `:down` is written
   out, or derived: every step above reverses itself when it holds what its reverse needs
   (an `:alter-column` its `:from`, an `:execute` its `down-sql`), and `rollback` refuses a
   migration that does not.
@@ -53,7 +55,7 @@
 (def- step-ops
   #{:create-table
     :drop-table :rename-table :add-column :drop-column :rename-column :alter-column
-    :create-index :drop-index :execute :run})
+    :create-index :drop-index :add-constraint :drop-constraint :execute :run})
 
 (defn- concurrent? (step)
   (and (or (= (first step) :create-index) (= (first step) :drop-index))
@@ -115,6 +117,12 @@
         (let (table (nth args 0 nil) idx (nth args 1 nil) opts (nth args 2 nil))
           [(schema/drop-index-sql (if (map? idx) (get (schema/index-spec table idx) :name) idx)
              (or opts {}))])
+      :add-constraint [(schema/add-constraint-sql (first args) (second args))]
+      :drop-constraint
+        (let (table (nth args 0 nil) c (nth args 1 nil) opts (nth args 2 nil))
+          [(schema/drop-constraint-sql table
+             (if (map? c) (get (schema/constraint-spec table c) :name) c)
+             (or opts {}))])
       :execute [(first args)]
       :run []
       (error "migration: unknown step " (pr-str step)))))
@@ -141,6 +149,8 @@
       :create-index [:drop-index (first args) (second args) (nth args 2 nil)]
       :drop-index
         (when (map? (second args)) [:create-index (first args) (second args) (nth args 2 nil)])
+      :add-constraint [:drop-constraint (first args) (second args)]
+      :drop-constraint (when (map? (second args)) [:add-constraint (first args) (second args)])
       :execute (when (second args) [:execute (second args) (first args)])
       :run (when (second args) [:run (second args) (first args)])
       nil)))
@@ -180,14 +190,26 @@
                     [:where (get spec :where)]]
         (fn (pair) (not (nil? (second pair))))))))
 
+(defn- normal-constraint (table c)
+  (let (spec (schema/constraint-spec table c))
+    (if (get spec :unique)
+      {:name (get spec :name) :unique (into [] (get spec :unique))}
+      {:name (get spec :name) :check (get spec :check)})))
+
+(defn- constraint-map (table cs)
+  (reduce (or cs [])
+    {}
+    (fn (acc c)
+      (let (spec (normal-constraint table c)) (assoc acc (get spec :name) spec)))))
+
 (defn- update-table (model table f)
   (let (current (get model table))
     (when (nil? current) (error "migration: model: no table " (pr-str table)))
     (assoc model table (f current))))
 
 (defn apply-step (model step)
-  "Fold one step into `model` — `{table {:fields {f spec} :primary-key k :indexes {name idx}}}`.
-  `:execute` and `:run` change nothing it can see."
+  "Fold one step into `model` — `{table {:fields {f spec} :primary-key k :indexes {name idx}
+  :constraints {name c}}}`. `:execute` and `:run` change nothing it can see."
   (let (op (first step)
         args (into [] (rest step)))
     (case op
@@ -202,7 +224,8 @@
                            (fn (acc f)
                              (assoc acc f (normal-field (get (get definition :fields) f)))))
                  :primary-key (get definition :primary-key)
-                 :indexes {}})))
+                 :indexes {}
+                 :constraints (constraint-map table (get definition :constraints))})))
       :drop-table (dissoc model (first args))
       :rename-table
         (let (from (nth args 0 nil) to (nth args 1 nil))
@@ -232,7 +255,21 @@
                           name
                             (assoc idx
                               :columns
-                                (into [] (map (get idx :columns) (fn (c) (if (= c from) to c)))))))))))))
+                                (into [] (map (get idx :columns) (fn (c) (if (= c from) to c)))))))))
+                :constraints
+                  (reduce (keys (get t :constraints))
+                    {}
+                    (fn (acc name)
+                      (let (c (get (get t :constraints) name))
+                        (assoc acc
+                          name
+                            (if (get c :unique)
+                              (assoc c
+                                :unique
+                                  (into []
+                                    (map (get c :unique)
+                                      (fn (column) (if (= column from) to column)))))
+                              c)))))))))
       :alter-column
         (let (table (nth args 0 nil) field (nth args 1 nil) changes (nth args 2 nil))
           (update-table model
@@ -263,6 +300,19 @@
               idx (nth args 1 nil)
               name (if (map? idx) (get (schema/index-spec table idx) :name) idx))
           (update-table model table (fn (t) (assoc t :indexes (dissoc (get t :indexes) name)))))
+      :add-constraint
+        (let (table (nth args 0 nil)
+              spec (normal-constraint table (nth args 1 nil)))
+          (update-table model
+            table
+            (fn (t) (assoc t :constraints (assoc (get t :constraints) (get spec :name) spec)))))
+      :drop-constraint
+        (let (table (nth args 0 nil)
+              c (nth args 1 nil)
+              name (if (map? c) (get (schema/constraint-spec table c) :name) c))
+          (update-table model
+            table
+            (fn (t) (assoc t :constraints (dissoc (get t :constraints) name)))))
       model)))
 
 (defn model (migrations)
@@ -282,7 +332,8 @@
            :primary-key (get s :primary-key)
            :indexes (reduce (schema/indexes s)
                       {}
-                      (fn (is idx) (assoc is (get idx :name) (normal-index (get s :table) idx))))}))))
+                      (fn (is idx) (assoc is (get idx :name) (normal-index (get s :table) idx))))
+           :constraints (constraint-map (get s :table) (get s :constraints))}))))
 
 ;; ---- diffing: model → schemas ----------------------------------------------------------
 
@@ -294,10 +345,21 @@
     (if (empty? opts) type [type opts])))
 
 (defn- definition-of (t)
-  {:primary-key (get t :primary-key)
-   :fields (reduce (keys (get t :fields))
-             {}
-             (fn (acc f) (assoc acc f (source-spec (get (get t :fields) f)))))})
+  (let (definition {:primary-key (get t :primary-key)
+                    :fields (reduce (keys (get t :fields))
+                              {}
+                              (fn (acc f) (assoc acc f (source-spec (get (get t :fields) f)))))}
+        constraints (get t :constraints))
+    (if (empty? constraints)
+      definition
+      (assoc definition
+        :constraints (into [] (map (sort (keys constraints)) (fn (name) (get constraints name))))))))
+
+(defn- constraint-steps (table have want)
+  (append (map (seq/filter (sort (keys have)) (fn (name) (not (= (get have name) (get want name)))))
+            (fn (name) [:drop-constraint table (get have name)]))
+    (map (seq/filter (sort (keys want)) (fn (name) (not (= (get have name) (get want name)))))
+      (fn (name) [:add-constraint table (get want name)]))))
 
 (defn- index-steps (table have want)
   (append (map (seq/filter (keys have) (fn (name) (not (= (get have name) (get want name)))))
@@ -340,7 +402,11 @@
                          (and (contains? have-fields f)
                            (not (= (get have-fields f) (get want-fields f))))))
                   (fn (f) (changed-field-step table f (get have-fields f) (get want-fields f)))))
-    (append added altered dropped (index-steps table (get have :indexes) (get want :indexes)))))
+    (append added
+      altered
+      (constraint-steps table (get have :constraints) (get want :constraints))
+      dropped
+      (index-steps table (get have :indexes) (get want :indexes)))))
 
 (defn diff (have want)
   "The steps taking model `have` to model `want`: tables created and dropped, columns

@@ -142,16 +142,27 @@
 (defn- bind (value params)
   [(placeholder params) (conj params value)])
 
+;; The operators that compile to bare infix SQL. Postgres binds `<>` tighter than `IS` and
+;; `NOT` looser than `=`, so one of these inside another expression is parenthesised: without
+;; it `[:<> [:is-nil :a] [:is-nil :b]]` would read as `a IS NULL <> b IS NULL`.
+(def- infix-predicates
+  #{:= :<> :!= :> :>= :< :<= :like :ilike :is-nil :not-nil :in :not-in :not})
+
+(defn- compile-nested (x params)
+  (let ([sql next] (compile-expr x params))
+    (if (contains? infix-predicates (first x)) [(str "(" sql ")") next] [sql next])))
+
 (defn compile-value (x params)
-  "A right-hand operand: an expression compiles, anything else is bound as a parameter."
-  (if (expression? x) (compile-expr x params) (bind x params)))
+  "A right-hand operand: an expression compiles (parenthesised when it is a predicate),
+  anything else is bound as a parameter."
+  (if (expression? x) (compile-nested x params) (bind x params)))
 
 (defn compile-operand (x params)
-  "A left-hand operand: a keyword is a column, an expression compiles, anything else
-  is bound."
+  "A left-hand operand: a keyword is a column, an expression compiles (parenthesised when
+  it is a predicate), anything else is bound."
   (cond
     (keyword? x) [(ident x) params]
-    (expression? x) (compile-expr x params)
+    (expression? x) (compile-nested x params)
     :else (bind x params)))
 
 (defn- compile-list (xs params compile-one)
@@ -362,12 +373,14 @@
                                                       (fn (c p) (compile-value (get row c) p))))
                                     [(str "(" (string/join sqls ", ") ")") next])))
         [conflict params] (conflict-sql (get opts :on-conflict) after-values))
+    (when (and (empty? columns) (> (count rows) 1))
+      (error "query: insert-all-sql: several rows with no columns — insert them one at a time"))
     [(str "INSERT INTO "
        (ident table)
-       " ("
-       (string/join (map columns ident) ", ")
-       ") VALUES "
-       (string/join tuples ", ")
+       ;; a row that sets no column takes every default
+       (if (empty? columns)
+         " DEFAULT VALUES"
+         (str " (" (string/join (map columns ident) ", ") ") VALUES " (string/join tuples ", ")))
        conflict
        (returning-sql opts))
       params]))

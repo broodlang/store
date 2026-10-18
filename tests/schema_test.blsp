@@ -64,3 +64,29 @@
     (is (= (map (schema/indexes {:table :t :indexes [{:columns [:a]} {:columns [:b] :name "x"}]})
              (fn (i) (get i :name)))
           (list "t_a_index" "x")))))
+
+(describe "schema: constraints"
+  (test "a unique and a check constraint, named the way Postgres names them"
+    (is (= (schema/create-table-sql {:table :orgs
+                                     :primary-key :id
+                                     :fields {:id :serial}
+                                     :constraints [{:unique [:name]}
+                                                    {:check [:<> [:is-nil :name] [:is-nil :user_id]]}]})
+          (str "CREATE TABLE \"orgs\" (\"id\" serial, PRIMARY KEY (\"id\"), "
+            "CONSTRAINT \"orgs_name_key\" UNIQUE (\"name\"), "
+            "CONSTRAINT \"orgs_check\" CHECK ((\"name\" IS NULL) <> (\"user_id\" IS NULL)))"))))
+  (test "a predicate inside another expression is parenthesised"
+    (is (= (schema/inline-expr [:= [:not [:= :a 1]] [:like :b "x%"]])
+          "(NOT (\"a\" = 1)) = (\"b\" LIKE 'x%')"))
+    (is (= (schema/inline-expr [:and [:not-nil :a] [:like :name "change/%"]])
+          "(\"a\" IS NOT NULL AND \"name\" LIKE 'change/%')")))
+  (test "a check's values are inlined, and a name can be given"
+    (is (= (schema/constraint-sql :t {:name "t_role" :check [:in :role ["a" "b"]]})
+          "CONSTRAINT \"t_role\" CHECK (\"role\" IN ('a', 'b'))")))
+  (test "add and drop"
+    (is (= (schema/add-constraint-sql :t {:unique [:a :b]})
+          "ALTER TABLE \"t\" ADD CONSTRAINT \"t_a_b_key\" UNIQUE (\"a\", \"b\")"))
+    (is (= (schema/drop-constraint-sql :t "t_a_b_key" {:if-exists true})
+          "ALTER TABLE \"t\" DROP CONSTRAINT IF EXISTS \"t_a_b_key\"")))
+  (test "a constraint that is neither is an error"
+    (assert-error (schema/constraint-spec :t {:name "x"}))))
