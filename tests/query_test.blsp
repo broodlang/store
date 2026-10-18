@@ -99,8 +99,23 @@
                                                    (query/where [:= :t.u [:col :u.id]]))]))))
           "SELECT * FROM \"u\" WHERE EXISTS (SELECT * FROM \"t\" WHERE \"t\".\"u\" = \"u\".\"id\")")))
   (test "lock"
-    (is (= (first (query/to-sql (-> (query/from :u) (query/lock "FOR UPDATE"))))
-          "SELECT * FROM \"u\" FOR UPDATE")))
+    (is (= (first (query/to-sql (-> (query/from :u) (query/lock :update))))
+          "SELECT * FROM \"u\" FOR UPDATE"))
+    (is (= (first (query/to-sql (-> (query/from :jobs)
+                                  (query/limit 1)
+                                  (query/lock :update :skip-locked))))
+          "SELECT * FROM \"jobs\" LIMIT $1 FOR UPDATE SKIP LOCKED"))
+    (assert-error (query/lock (query/from :u) "FOR UPDATE"))
+    (assert-error (query/lock (query/from :u) :update :later)))
+  (test "any binds the whole list as one parameter, whatever its length"
+    (is (= (query/to-sql (-> (query/from :objects) (query/where [:any :address ["a" "b" "c"]])))
+          ["SELECT * FROM \"objects\" WHERE \"address\" = ANY($1)" [["a" "b" "c"]]]))
+    (is (= (first (query/to-sql (-> (query/from :objects) (query/where [:any :address (list "a")]))))
+          "SELECT * FROM \"objects\" WHERE \"address\" = ANY($1)")))
+  (test "not takes a boolean column as well as an expression"
+    (is (= (first (query/to-sql (-> (query/from :objects)
+                                  (query/where [:and [:= :p 1] [:not :missing]]))))
+          "SELECT * FROM \"objects\" WHERE (\"p\" = $1 AND NOT (\"missing\"))")))
   (test "raw is the escape hatch"
     (is (= (first (query/to-sql (-> (query/from :p) (query/where [:like :name [:raw "'change/%'"]]))))
           "SELECT * FROM \"p\" WHERE \"name\" LIKE 'change/%'"))))

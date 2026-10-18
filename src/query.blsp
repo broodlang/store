@@ -23,6 +23,11 @@
     [:in col [v …]] [:in col subquery] [:not-in col [v …]]
     [:like col pat] [:ilike col pat] [:is-nil col] [:not-nil col]
     [:and e …] [:or e …] [:not e] [:exists subquery]
+    [:any col [v …]]              ; col = ANY($n): the whole list is ONE bound array
+
+  `:any` is `:in` for a long or variable-length list: one parameter and one statement text
+  however many values (an `:in` list binds one parameter per value, and each length is a
+  new statement). An empty list matches nothing.
 
   Value expressions, usable in a comparison, a `select`, an `order-by`, and the values of
   an insert or update:
@@ -99,9 +104,26 @@
   "Skip the first `n` rows."
   (assoc q :offset n))
 
-(defn lock (q clause)
-  "A row-locking clause, verbatim: `\"FOR UPDATE\"`, `\"FOR UPDATE SKIP LOCKED\"`."
-  (assoc q :lock clause))
+(def- lock-strengths
+  {:update "FOR UPDATE"
+   :no-key-update "FOR NO KEY UPDATE"
+   :share "FOR SHARE"
+   :key-share "FOR KEY SHARE"})
+
+(def- lock-waits {:skip-locked " SKIP LOCKED" :nowait " NOWAIT"})
+
+(defn lock (q strength &optional wait)
+  "Lock the rows the query reads: `strength` is `:update`, `:no-key-update`, `:share` or
+  `:key-share`, and `wait` — when another transaction holds one — `:skip-locked` (leave it
+  out: a queue's claim) or `:nowait` (fail). `(lock q :update :skip-locked)`."
+  (when (not (contains? lock-strengths strength))
+    (error "query: lock strength must be one of "
+      (pr-str (keys lock-strengths))
+      ", not "
+      (pr-str strength)))
+  (when (and wait (not (contains? lock-waits wait)))
+    (error "query: lock wait must be :skip-locked or :nowait, not " (pr-str wait)))
+  (assoc q :lock (str (get lock-strengths strength) (if wait (get lock-waits wait) ""))))
 
 ;; ---- identifiers -------------------------------------------------------------
 
@@ -131,9 +153,9 @@
 
 (def- operators
   #{:=
-    :<> :!= :> :>= :< :<= :and :or :not :in :not-in :like :ilike :is-nil :not-nil :exists
-    :col :excluded :+ :- :* :/ :count :count-distinct :sum :max :min :avg :coalesce :lower
-    :upper :as :raw})
+    :<> :!= :> :>= :< :<= :and :or :not :in :not-in :any :like :ilike :is-nil :not-nil :exists :col
+    :excluded :+ :- :* :/ :count :count-distinct :sum :max :min :avg :coalesce :lower :upper
+    :as :raw})
 
 (defn expression? (x)
   "True when `x` is a query expression — a vector headed by a known operator."
@@ -146,7 +168,7 @@
 ;; `NOT` looser than `=`, so one of these inside another expression is parenthesised: without
 ;; it `[:<> [:is-nil :a] [:is-nil :b]]` would read as `a IS NULL <> b IS NULL`.
 (def- infix-predicates
-  #{:= :<> :!= :> :>= :< :<= :like :ilike :is-nil :not-nil :in :not-in :not})
+  #{:= :<> :!= :> :>= :< :<= :like :ilike :is-nil :not-nil :in :not-in :any :not})
 
 (defn- compile-nested (x params)
   (let ([sql next] (compile-expr x params))
@@ -208,7 +230,10 @@
         (= op :and) (compile-junction "AND" args params)
         (= op :or) (compile-junction "OR" args params)
         (= op :not)
-          (let ([sql next] (compile-expr (first args) params))
+        ;; a boolean column, `[:not :missing]`, or any expression
+          (let ([sql next] (if (keyword? (first args))
+                             [(ident (first args)) params]
+                             (compile-expr (first args) params)))
             [(str "NOT (" sql ")") next])
         (= op :in) (compile-in false (first args) (second args) params)
         (= op :not-in) (compile-in true (first args) (second args) params)
@@ -220,6 +245,10 @@
           (let ([sql next] (compile-operand (first args) params)) [(str sql " IS NULL") next])
         (= op :not-nil)
           (let ([sql next] (compile-operand (first args) params)) [(str sql " IS NOT NULL") next])
+        (= op :any)
+          (let ([column-sql after-column] (compile-operand (first args) params)
+                [list-sql after-list] (bind (into [] (second args)) after-column))
+            [(str column-sql " = ANY(" list-sql ")") after-list])
         (= op :exists)
           (let ([sql next] (compile-select (first args) params)) [(str "EXISTS (" sql ")") next])
         (= op :col) [(ident (first args)) params]
