@@ -54,9 +54,9 @@
     [:excluded :col]              ; the proposed row in an ON CONFLICT … DO UPDATE
     [:+ a b …] [:- a b] [:* a b] [:/ a b]
     [:count] [:count col] [:count-distinct col] [:sum col] [:max col] [:min col] [:avg col]
-    [:coalesce a b …] [:lower a] [:upper a]
-    [:call :date_trunc [:literal \"day\"] :at]   ; any function, its name quoted
-    [:cast expr :integer]         ; CAST(expr AS integer) — a type name, checked
+    [:coalesce a b …] [:lower a] [:upper a] [:greatest a b …] [:least a b …] [:nullif a b]
+    [:call :date_trunc [:literal \"day\"] :at]   ; any function — its name checked, not quoted
+    [:cast expr :integer]         ; CAST(expr AS integer) — words, a precision, [] only
     [:case test value … :else value]
     [:filter [:count] [:= :ok true]]             ; count(*) FILTER (WHERE …)
     [:over [:call :row_number] {:partition-by [:a] :order-by [[:b :desc]]}]
@@ -159,6 +159,35 @@
   (which must start with the same columns)."
   (assoc q :distinct-on columns))
 
+;; A join's and a combination's kind is a keyword, and so is a lock: data a query built by
+;; hand can carry too, turned into SQL — and checked — only when the query compiles, so no
+;; text in a query map reaches the statement.
+(def- join-sql
+  {:inner "JOIN"
+   :left "LEFT JOIN"
+   :right "RIGHT JOIN"
+   :full "FULL JOIN"
+   :cross "CROSS JOIN"
+   :lateral "JOIN LATERAL"
+   :left-lateral "LEFT JOIN LATERAL"})
+
+(def- combination-sql
+  {:union "UNION"
+   :union-all "UNION ALL"
+   :intersect "INTERSECT"
+   :intersect-all "INTERSECT ALL"
+   :except "EXCEPT"
+   :except-all "EXCEPT ALL"})
+
+(defn- sql-for (table kind context)
+  (or (get table kind)
+    (error "query: "
+      context
+      " is one of "
+      (pr-str (sort-by (keys table) ->string))
+      ", not "
+      (pr-str kind))))
+
 (defn- add-join (q kind source table-alias on)
   (let (table (table-of source))
     (when (and (query? table) (nil? table-alias))
@@ -169,33 +198,33 @@
   "INNER JOIN `table` AS `table-alias` ON the condition `on` — compare two columns with
   `[:= :m.organisation_id [:col :o.id]]`. `table-alias` may be nil; `table` may be a
   schema, or a query (with an alias)."
-  (add-join q "JOIN" table table-alias on))
+  (add-join q :inner table table-alias on))
 
 (defn left-join (q table table-alias on)
   "LEFT JOIN `table` AS `table-alias` ON `on` (see `join`)."
-  (add-join q "LEFT JOIN" table table-alias on))
+  (add-join q :left table table-alias on))
 
 (defn right-join (q table table-alias on)
   "RIGHT JOIN `table` AS `table-alias` ON `on` (see `join`)."
-  (add-join q "RIGHT JOIN" table table-alias on))
+  (add-join q :right table table-alias on))
 
 (defn full-join (q table table-alias on)
   "FULL JOIN `table` AS `table-alias` ON `on` (see `join`)."
-  (add-join q "FULL JOIN" table table-alias on))
+  (add-join q :full table table-alias on))
 
 (defn cross-join (q table &optional table-alias)
   "CROSS JOIN `table` — every row with every row."
-  (add-join q "CROSS JOIN" table table-alias nil))
+  (add-join q :cross table table-alias nil))
 
 (defn lateral-join (q subquery table-alias &optional on)
   "JOIN LATERAL (`subquery`) AS `table-alias` — a subquery that reads the rows before it
   (`[:col :p.id]` inside it), run once per row: the top N of each group. `on` defaults to
   TRUE."
-  (add-join q "JOIN LATERAL" subquery table-alias on))
+  (add-join q :lateral subquery table-alias on))
 
 (defn left-lateral-join (q subquery table-alias &optional on)
   "LEFT JOIN LATERAL — `lateral-join` that keeps a row its subquery returns nothing for."
-  (add-join q "LEFT JOIN LATERAL" subquery table-alias on))
+  (add-join q :left-lateral subquery table-alias on))
 
 (defn- conjoin (a b)
   (cond
@@ -271,7 +300,7 @@
       (pr-str strength)))
   (when (and wait (not (contains? lock-waits wait)))
     (error "query: lock wait must be :skip-locked or :nowait, not " (pr-str wait)))
-  (assoc q :lock (str (get lock-strengths strength) (if wait (get lock-waits wait) ""))))
+  (assoc q :lock {:strength strength :wait wait}))
 
 (defn- add-cte (q name subquery recursive?)
   (when (not (query? subquery)) (error "query: a CTE is a query, not " (pr-str subquery)))
@@ -293,27 +322,27 @@
 (defn union (q other)
   "The rows of `q` or `other`, duplicates removed. `q`'s ORDER BY / LIMIT / OFFSET apply
   to the combined rows."
-  (add-combination q "UNION" other))
+  (add-combination q :union other))
 
 (defn union-all (q other)
   "The rows of `q` and then `other`, duplicates kept (see `union`)."
-  (add-combination q "UNION ALL" other))
+  (add-combination q :union-all other))
 
 (defn intersect (q other)
   "The rows in both `q` and `other` (see `union`)."
-  (add-combination q "INTERSECT" other))
+  (add-combination q :intersect other))
 
 (defn intersect-all (q other)
   "INTERSECT ALL — `intersect` keeping duplicates."
-  (add-combination q "INTERSECT ALL" other))
+  (add-combination q :intersect-all other))
 
 (defn except (q other)
   "The rows of `q` that are not in `other` (see `union`)."
-  (add-combination q "EXCEPT" other))
+  (add-combination q :except other))
 
 (defn except-all (q other)
   "EXCEPT ALL — `except` keeping duplicates."
-  (add-combination q "EXCEPT ALL" other))
+  (add-combination q :except-all other))
 
 ;; ---- identifiers -------------------------------------------------------------
 
@@ -329,19 +358,86 @@
   (if (nil? table-alias) (ident table) (str (ident table) " AS " (ident table-alias))))
 
 ;; A type name goes into the SQL text, so it is checked rather than quoted (a quoted
-;; `"integer"` is not the type): letters, digits, `_`, spaces, and the `[]` / `(10,2)` of
-;; an array or a precision.
-(def- type-characters
-  (into #{}
-    (string/->list "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ []().,")))
+;; `"integer"` is not the type). It is words — `timestamp with time zone` — then optionally
+;; a precision of digits and commas, more words, and any number of `[]`: nothing in it can
+;; close the CAST or start another expression.
+(def- word-characters
+  (into #{} (string/->list "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ .")))
+
+(def- precision-characters (into #{} (string/->list "0123456789, ")))
+
+(defn- type-name? (name)
+  (letrec (walk (fn (characters state)
+                  (if (empty? characters)
+                    (contains? #{:words :after-precision :array-closed} state)
+                    (let (c (first characters)
+                          more (rest characters))
+                      (case state
+                        :words
+                          (cond
+                            (contains? word-characters c) (walk more :words)
+                            (= c "(") (walk more :precision)
+                            (= c "[") (walk more :array-open)
+                            :else false)
+                        :precision
+                          (cond
+                            (contains? precision-characters c) (walk more :precision)
+                            (= c ")") (walk more :after-precision)
+                            :else false)
+                        :after-precision
+                          (cond
+                            (contains? word-characters c) (walk more :after-precision)
+                            (= c "[") (walk more :array-open)
+                            :else false)
+                        :array-open
+                          (cond
+                            (= c "]") (walk more :array-closed)
+                            (contains? (into #{} (string/->list "0123456789")) c)
+                              (walk more :array-open)
+                            :else false)
+                        :array-closed (if (= c "[") (walk more :array-open) false)
+                        false)))))
+    (let (characters (string/->list name))
+      (and (not (empty? characters))
+        (contains? (into #{}
+                     (string/->list "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"))
+          (first characters))
+        (walk characters :words)))))
 
 (defn- type-name (type)
   (let (name (if (keyword? type) (->string type) type))
-    (when (not (and (string? name)
-                 (not (= name ""))
-                 (every? (string/->list name) (fn (c) (contains? type-characters c)))))
+    (when (not (and (string? name) (type-name? name)))
       (error "query: not a type name: " (pr-str type)))
     name))
+
+;; A function name is an identifier, checked and left unquoted: `greatest`, `nullif` and
+;; `least` are keywords to Postgres rather than functions, so a quoted `"greatest"(…)` names
+;; nothing — and an unquoted name folds to lower case the way any SQL a person writes does.
+(def- identifier-start
+  (into #{} (string/->list "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")))
+
+;; Words that would change the statement around the call rather than name a function —
+;; `[:call :distinct :x]` is `SELECT DISTINCT (x)`.
+(def- reserved-words
+  #{"all"
+    "and" "any" "array" "as" "asc" "both" "case" "cast" "check" "column" "constraint" "create"
+    "default" "desc" "distinct" "do" "else" "end" "except" "exists" "false" "fetch" "for" "from"
+    "grant" "group" "having" "in" "intersect" "into" "is" "join" "lateral" "leading" "limit" "not"
+    "null" "offset" "on" "only" "or" "order" "returning" "select" "some" "table" "then" "to"
+    "trailing" "true" "union" "unique" "using" "when" "where" "window" "with"})
+
+(def- upper-case-letters (into #{} (string/->list "ABCDEFGHIJKLMNOPQRSTUVWXYZ")))
+
+(defn- function-name (name)
+  (let (text (if (keyword? name) (->string name) name)
+        characters (if (string? text) (string/->list text) ()))
+    (when (not (and (not (empty? characters))
+                 (contains? identifier-start (first characters))
+                 (every? characters (fn (c) (and (contains? word-characters c) (not (= c " ")))))
+                 (not (contains? reserved-words (string/lower text)))))
+      (error "query: not a function name: " (pr-str name)))
+    ;; unquoted, a name folds to lower case — so one written with a capital is quoted to keep it
+    (if (any? characters (fn (c) (contains? upper-case-letters c))) (ident text) text)))
 
 ;; ---- expression compiler: expr -> [sql params'] -------------------------------
 ;; `params` is the accumulator so far; each bound value becomes the next $N, so the
@@ -356,14 +452,23 @@
 (def- arithmetic-sql {:+ "+" :- "-" :* "*" :/ "/"})
 
 (def- function-sql
-  {:sum "sum" :max "max" :min "min" :avg "avg" :coalesce "coalesce" :lower "lower" :upper "upper"})
+  {:sum "sum"
+   :max "max"
+   :min "min"
+   :avg "avg"
+   :coalesce "coalesce"
+   :lower "lower"
+   :upper "upper"
+   :greatest "greatest"
+   :least "least"
+   :nullif "nullif"})
 
 (def- operators
   #{:=
     :<> :!= :> :>= :< :<= :between :and :or :not :in :not-in :any :like :ilike :not-like
     :not-ilike :is-nil :not-nil :distinct-from :not-distinct-from :exists :col :excluded :+ :- :* :/
-    :count :count-distinct :sum :max :min :avg :coalesce :lower :upper :call :cast :case
-    :filter :over :-> :->> :as :literal :fragment :raw})
+    :count :count-distinct :sum :max :min :avg :coalesce :lower :upper :greatest :least :nullif
+    :call :cast :case :filter :over :-> :->> :as :literal :fragment :raw})
 
 (defn expression? (x)
   "True when `x` is a query expression — a vector headed by a known operator."
@@ -388,11 +493,12 @@
 ;; The operators that compile to bare infix SQL. Postgres binds `<>` tighter than `IS` and
 ;; `NOT` looser than `=`, so one of these inside another expression is parenthesised: without
 ;; it `[:<> [:is-nil :a] [:is-nil :b]]` would read as `a IS NULL <> b IS NULL`. A fragment is
-;; whatever its text says, so it is parenthesised too.
+;; whatever its text says, so it is parenthesised too — and inside an AND / OR as well
+;; (`compile-condition`), where a comparison needs no parentheses but `a = ? OR b = ?` does.
 (def- infix-predicates
   #{:=
     :<> :!= :> :>= :< :<= :between :like :ilike :not-like :not-ilike :is-nil :not-nil :in
-    :not-in :any :not :distinct-from :not-distinct-from :-> :->> :fragment})
+    :not-in :any :not :distinct-from :not-distinct-from :-> :->> :fragment :raw})
 
 (defn- compile-nested (x params)
   (let ([sql next] (compile-expr x params))
@@ -427,10 +533,18 @@
             [sql next] (compile-one x current))
         [(conj sqls sql) next]))))
 
+(defn- compile-condition (x params)
+  "One operand of AND / OR. A fragment or a raw piece is whatever its text says — `a = ? OR
+  b = ?` — so it is parenthesised, or an AND beside it would bind into its OR."
+  (let ([sql next] (compile-expr x params))
+    (if (and (vector? x) (contains? #{:fragment :raw} (first x)))
+      [(str "(" sql ")") next]
+      [sql next])))
+
 (defn- compile-junction (separator exprs params)
   (if (empty? exprs)
     [(if (= separator "AND") "TRUE" "FALSE") params]
-    (let ([sqls next] (compile-list exprs params compile-expr))
+    (let ([sqls next] (compile-list exprs params compile-condition))
       [(str "(" (string/join sqls (str " " separator " ")) ")") next])))
 
 (defn- equalities (m)
@@ -438,32 +552,44 @@
   (let (comparisons (map (sorted-keys m) (fn (k) [:= k (get m k)])))
     (if (= (count comparisons) 1) (first comparisons) (into [:and] comparisons))))
 
+(defn- check-operand (expr value nil-allowed?)
+  "Refuse a value that cannot mean what `expr` says: nil where SQL compares it to nothing,
+  and a keyword where it could be a column or a value."
+  (when (and (nil? value) (not nil-allowed?))
+    (error "query: "
+      (pr-str expr)
+      " is never true — nothing is equal to NULL in SQL. "
+      "Write [:is-nil col] for a missing value, or [:not-distinct-from col value] "
+      "when the value may be nil and should match one"))
+  (when (keyword? value)
+    (error "query: "
+      (pr-str expr)
+      " — "
+      (pr-str value)
+      " is a keyword, which could be a column or a value: write [:col "
+      (pr-str value)
+      "] for the column, or a string")))
+
 (defn- check-comparison (expr)
   (let ([op left right] expr)
-    (when (or (nil? left) (nil? right))
-      (error "query: "
-        (pr-str expr)
-        " is never true — nothing is equal to NULL in SQL. "
-        "Write [:is-nil col] for a missing value, or [:not-distinct-from col value] "
-        "when the value may be nil and should match one"))
-    (when (keyword? right)
-      (error "query: "
-        (pr-str expr)
-        " — the right side is a keyword, which could be a "
-        "column or a value: write [:col "
-        (pr-str right)
-        "] for the column, or a string"))))
+    (when (nil? left) (check-operand expr left false))
+    (check-operand expr right false)))
 
 (defn- compile-in (negated? column values params)
-  (let ([column-sql after-column] (compile-operand column params))
-    (cond
-      (map? values)
-        (let ([sub-sql after-sub] (compile-select values after-column))
-          [(str column-sql (if negated? " NOT IN (" " IN (") sub-sql ")") after-sub])
-      (empty? values) [(if negated? "TRUE" "FALSE") after-column]
-      :else
-        (let ([sqls next] (compile-list values after-column compile-value))
-          [(str column-sql (if negated? " NOT IN (" " IN (") (string/join sqls ", ") ")") next]))))
+  (cond
+    (map? values)
+      (let ([column-sql after-column] (compile-operand column params)
+            [sub-sql after-sub] (compile-select values after-column))
+        [(str column-sql (if negated? " NOT IN (" " IN (") sub-sql ")") after-sub])
+    ;; nothing is in an empty list — and the column is not compiled, so a value it would
+    ;; have bound does not leave a parameter the statement never mentions
+    (empty? values) [(if negated? "TRUE" "FALSE") params]
+    :else
+      (let (_ (map values
+                (fn (value) (check-operand [(if negated? :not-in :in) column values] value false)))
+            [column-sql after-column] (compile-operand column params)
+            [sqls next] (compile-list values after-column compile-value))
+        [(str column-sql (if negated? " NOT IN (" " IN (") (string/join sqls ", ") ")") next])))
 
 (defn- compile-call (name args params)
   (let ([sqls next] (compile-list args params compile-operand))
@@ -497,10 +623,13 @@
     (walk clauses "CASE" params)))
 
 (defn- order-term (term)
-  "An ORDER BY term as `[column direction]`: a bare column or expression is ascending."
-  (if (and (vector? term) (not (expression? term)))
-    (do (check-direction (second term)) term)
-    [term :asc]))
+  "An ORDER BY term as `[column direction]`: a pair whose second element is a direction —
+  checked first, so `[:count :desc]` is the column `count` rather than count(\"desc\") — or
+  a bare column or expression, ascending."
+  (cond
+    (and (vector? term) (= (count term) 2) (contains? directions (second term))) term
+    (and (vector? term) (not (expression? term))) (do (check-direction (second term)) term)
+    :else [term :asc]))
 
 (defn- compile-order-terms (terms params)
   (let ([sqls next] (compile-list terms
@@ -603,7 +732,9 @@
                                (compile-expr (first args) params)))
               [(str "NOT (" sql ")") next])
           (= op :between)
-            (let ([column-sql after-column] (compile-operand (first args) params)
+            (let (_ (check-operand expr (second args) false)
+                  _ (check-operand expr (nth args 2) false)
+                  [column-sql after-column] (compile-operand (first args) params)
                   [low-sql after-low] (compile-value (second args) after-column)
                   [high-sql after-high] (compile-value (nth args 2) after-low))
               [(str column-sql " BETWEEN " low-sql " AND " high-sql) after-high])
@@ -614,11 +745,16 @@
           (= op :not-nil)
             (let ([sql next] (compile-operand (first args) params)) [(str sql " IS NOT NULL") next])
           (= op :distinct-from)
-            (compile-binary (first args) " IS DISTINCT FROM " (second args) params)
+            (do
+              (check-operand expr (second args) true)
+              (compile-binary (first args) " IS DISTINCT FROM " (second args) params))
           (= op :not-distinct-from)
-            (compile-binary (first args) " IS NOT DISTINCT FROM " (second args) params)
+            (do
+              (check-operand expr (second args) true)
+              (compile-binary (first args) " IS NOT DISTINCT FROM " (second args) params))
           (= op :any)
-            (let ([column-sql after-column] (compile-operand (first args) params)
+            (let (_ (map (second args) (fn (value) (check-operand expr value false)))
+                  [column-sql after-column] (compile-operand (first args) params)
                   [list-sql after-list] (bind (into [] (second args)) after-column))
               [(str column-sql " = ANY(" list-sql ")") after-list])
           (= op :exists)
@@ -633,7 +769,7 @@
             (let ([sql next] (compile-operand (first args) params))
               [(str "count(DISTINCT " sql ")") next])
           (contains? function-sql op) (compile-call (get function-sql op) args params)
-          (= op :call) (compile-call (ident (first args)) (rest args) params)
+          (= op :call) (compile-call (function-name (first args)) (rest args) params)
           (= op :cast)
             (let ([sql next] (compile-operand (first args) params))
               [(str "CAST(" sql " AS " (type-name (second args)) ")") next])
@@ -685,7 +821,7 @@
     params
     (fn (j current)
       (let ([source after-source] (source-sql (get j :table) (get j :as) current)
-            kind (get j :kind)
+            kind (sql-for join-sql (get j :kind) "a join's :kind")
             [on-sql next] (cond
                             (= kind "CROSS JOIN") ["" after-source]
                             ;; a lateral join is usually ON TRUE — the subquery did the matching
@@ -744,7 +880,20 @@
     params
     (fn (combination current)
       (let ([sql next] (compile-select (get combination :query) current))
-        [(str " " (get combination :kind) " (" sql ")") next]))))
+        [(str " "
+           (sql-for combination-sql (get combination :kind) "a combination's :kind")
+           " ("
+           sql
+           ")")
+          next]))))
+
+(defn- lock-sql (lock)
+  (if (nil? lock)
+    ""
+    (let (wait (get lock :wait))
+      (str " "
+        (sql-for lock-strengths (get lock :strength) "a lock's strength")
+        (if (nil? wait) "" (sql-for lock-waits wait "a lock's wait"))))))
 
 (defn compile-select (q params)
   "Compile query `q` to `[sql params']`, numbering its parameters after `params` — what
@@ -774,7 +923,7 @@
        (string/join combinations "")
        order-sql
        limit-sql
-       (if (nil? (get q :lock)) "" (str " " (get q :lock))))
+       (lock-sql (get q :lock)))
       p10]))
 
 (defn to-sql (q)
@@ -807,10 +956,11 @@
 
 (defn- conflict-sql (conflict params)
   "The ON CONFLICT clause of an insert. `conflict` is
-  `{:target [:col …] | :constraint \"name\", :do :nothing | :replace [:col …] | {:col expr}, :where expr}`
-  — `:where` limits which conflicting rows a map's update touches (`[:col :t.missing]`);
-  — `:replace` takes each column from the proposed row, a map sets arbitrary expressions
-  (`{:objects [:+ :mur_object_counts.objects [:excluded :objects]]}`)."
+  `{:target [:col …] | :constraint \"name\", :do :nothing | [:col …] | {:col expr}, :where expr}`
+  — a vector of columns takes each from the proposed row, a map sets arbitrary expressions
+  (`{:objects [:+ :mur_object_counts.objects [:excluded :objects]]}`), and `:where` limits
+  which conflicting rows either update touches (`[:col :t.missing]`); with `:nothing` it is
+  an error."
   (if (nil? conflict)
     ["" params]
     (let (target (cond
@@ -822,13 +972,20 @@
           action (get conflict :do :nothing))
       (check-keys conflict #{:target :constraint :do :where} "an :on-conflict")
       (cond
-        (= action :nothing) [(str " ON CONFLICT" target " DO NOTHING") params]
+        (= action :nothing)
+          (do
+            (when (get conflict :where)
+              (error "query: an :on-conflict :where limits which rows an update touches, so "
+                ":do :nothing has none to limit"))
+            [(str " ON CONFLICT" target " DO NOTHING") params])
         (vector? action)
-          [(str " ON CONFLICT"
-             target
-             " DO UPDATE SET "
-             (string/join (map action (fn (c) (str (ident c) " = EXCLUDED." (ident c)))) ", "))
-            params]
+          (let ([where-sql next] (compile-clause " WHERE " (get conflict :where) params))
+            [(str " ON CONFLICT"
+               target
+               " DO UPDATE SET "
+               (string/join (map action (fn (c) (str (ident c) " = EXCLUDED." (ident c)))) ", ")
+               where-sql)
+              next])
         (map? action)
           (let ([sqls after-set] (compile-assignments action params)
                 [where-sql next] (compile-clause " WHERE " (get conflict :where) after-set))
@@ -887,10 +1044,26 @@
   "INSERT one `{:col value …}` row (see `insert-all-sql` for `opts`)."
   (insert-all-sql table [row] opts))
 
+(defn- every-row? (condition)
+  (cond
+    (nil? condition) true
+    (map? condition) (and (not (query? condition)) (empty? condition))
+    (and (vector? condition) (= (first condition) :and)) (every? (rest condition) every-row?)
+    :else false))
+
+(defn- check-condition (condition context)
+  "A write's condition must name something: nil, `{}` or an `[:and]` of nothing — a filter
+  that came out empty — would change every row. `update-all` / `delete-all` over `(from :t)` say that."
+  (when (every-row? condition)
+    (error "query: "
+      context " with no condition would change every row — "
+      "use update-all-sql / delete-all-sql over (from table) to mean that")))
+
 (defn update-sql (table changes condition &optional (opts {}))
   "UPDATE `table` SET `changes` WHERE `condition` (an expression or a map). A change's
   value may be an expression — `{:downloads [:+ :downloads 1]}` increments atomically."
   (check-keys opts #{:returning} "an update's options")
+  (check-condition condition "update-sql")
   (let ([sqls after-set] (compile-assignments changes [])
         [where-sql after-where] (compile-expr condition after-set)
         [returning params] (returning-sql opts after-where))
@@ -906,35 +1079,39 @@
 (defn delete-sql (table condition &optional (opts {}))
   "DELETE FROM `table` WHERE `condition` (an expression or a map)."
   (check-keys opts #{:returning} "a delete's options")
+  (check-condition condition "delete-sql")
   (let ([where-sql after-where] (compile-expr condition [])
         [returning params] (returning-sql opts after-where))
     [(str "DELETE FROM " (ident (table-of table)) " WHERE " where-sql returning) params]))
 
 ;; ---- DML over a query ------------------------------------------------------------
 ;; `update-all-sql` / `delete-all-sql` take the same query a SELECT would: its `:where`,
-;; its CTEs, and its joins — the first (inner) join becomes the UPDATE's FROM / the
-;; DELETE's USING, its ON folded into the WHERE. So the condition that lists rows is the
+;; its CTEs, and its inner joins, which become the UPDATE's FROM / the DELETE's USING
+;; list with their ONs folded into the WHERE — a JOIN there could not name the table being
+;; written. So the condition that lists rows is the
 ;; condition that changes them. A part that means nothing to a write — an ORDER, a LIMIT,
 ;; a GROUP — is an error rather than silently dropped.
 
 (def- write-keys #{:from :as :joins :where :with})
 
 (defn- write-source (q keyword-sql params)
-  "`[sql condition params']`: the FROM/USING list made of `q`'s joins, and the WHERE."
+  "`[sql condition params']`: the FROM/USING list made of `q`'s joins, and the WHERE — each
+  join's ON conjoined with the query's own condition. Postgres lets an item of that list
+  JOIN only what is in the list, never the table being written, so the joins are listed
+  rather than chained, and only an inner join, which a WHERE can stand for, is allowed."
   (let (joins (or (get q :joins) []))
+    (when (any? joins (fn (j) (not (= (get j :kind) :inner))))
+      (error "query: an update or a delete takes inner joins only — it writes the rows they "
+        "match — not a "
+        (pr-str (get (first (seq/filter joins (fn (j) (not (= (get j :kind) :inner))))) :kind))))
     (if (empty? joins)
       ["" (get q :where) params]
-      (let (head (first joins))
-        (when (not (= (get head :kind) "JOIN"))
-          (error "query: the first join of an update or a delete becomes its "
-            (string/trim keyword-sql)
-            " list, so it is an inner join, not a "
-            (get head :kind)))
-        (let ([head-sql after-head] (source-sql (get head :table) (get head :as) params)
-              [joins-sql after-joins] (compile-joins (rest joins) after-head))
-          [(str keyword-sql head-sql (string/join joins-sql ""))
-            (conjoin (get head :on) (get q :where))
-            after-joins])))))
+      (let ([sqls next] (compile-list joins
+                          params
+                          (fn (j current) (source-sql (get j :table) (get j :as) current))))
+        [(str keyword-sql (string/join sqls ", "))
+          (reduce (map joins (fn (j) (get j :on))) (get q :where) (fn (acc on) (conjoin on acc)))
+          next]))))
 
 (defn- write-target (q context)
   (check-keys q write-keys context)
@@ -946,7 +1123,7 @@
 
 (defn update-all-sql (source changes &optional (opts {}))
   "UPDATE every row query `source` selects (or a whole table) SET `changes`: its WHERE,
-  its CTEs and its joins (the first one becomes FROM). `:returning :all` is the updated
+  its CTEs and its inner joins (listed in FROM). `:returning :all` is the updated
   table's columns."
   (check-keys opts #{:returning} "an update's options")
   (let (q (to-query source)
@@ -968,7 +1145,7 @@
 
 (defn delete-all-sql (source &optional (opts {}))
   "DELETE every row query `source` selects (or a whole table): its WHERE, its CTEs and
-  its joins (the first one becomes USING). `:returning :all` is the deleted table's
+  its inner joins (listed in USING). `:returning :all` is the deleted table's
   columns."
   (check-keys opts #{:returning} "a delete's options")
   (let (q (to-query source)

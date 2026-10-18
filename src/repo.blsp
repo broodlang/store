@@ -127,10 +127,12 @@
   (first (all repo (query/limit (query/to-query q) 1))))
 
 (defn fetch-by (repo source condition)
-  "The one row of `source` (a table, a schema or a query) matching `condition` — a map
-  `{:email e}` or an expression — or nil. More than one is an error, not a coin toss: a
+  "The one row of `source` (a table, a schema or a query — its lock kept) matching
+  `condition` — a map `{:email e}` or an expression — or nil. Over a query with a limit, a
+  distinct, a grouping or a union, the condition is on those rows, so it names their columns
+  unqualified. More than one is an error, not a coin toss: a
   lookup that is not unique is a bug in the lookup."
-  (let (rows (all repo (-> (query/to-query source) (query/where condition) (query/limit 2))))
+  (let (rows (all repo (-> (over-rows source true) (query/where condition) (query/limit 2))))
     (when (> (count rows) 1)
       (error "repo: fetch-by found more than one row for " (pr-str condition)))
     (first rows)))
@@ -141,15 +143,36 @@
   (let (key (if (and (map? source) (contains? source :primary-key)) (get source :primary-key) :id))
     (fetch-by repo source {key id})))
 
-(defn- unordered (q)
-  (dissoc (query/to-query q) :order :limit :offset))
+;; The parts that decide WHICH rows a query has, beyond its WHERE. A query with one of them
+;; is read as a subquery before a count, a sum or a condition is put on it — the way Ecto's
+;; aggregate does — or the select it is given would replace one arm of a union, a count
+;; would ignore the limit, and a DISTINCT ON would refuse the count outright.
+(def- row-shaping-keys [:limit :offset :distinct :distinct-on :group :having :combinations])
+
+(defn- over-rows (source keep-lock?)
+  "`source` as a query a select or a condition can be put on: itself less its ORDER BY (and
+  its lock, unless `keep-lock?` — an aggregate cannot be locked), or, when something besides
+  its WHERE decides its rows, those rows as a subquery (`store_rows`, so a column is then
+  named unqualified) — whole, ORDER BY and lock included, which a LIMIT or a DISTINCT ON
+  picks its rows by. A grouped query that selects nothing selects its groups, which is
+  what its rows are."
+  (let (q (query/to-query source))
+    (cond
+      (any? row-shaping-keys (fn (k) (contains? q k)))
+        (query/from (if (and (contains? q :group) (nil? (get q :select)))
+                      (query/select q (get q :group))
+                      q)
+          :store_rows)
+      keep-lock? (dissoc q :order)
+      :else (dissoc q :order :lock))))
 
 (defn aggregate (repo q op &optional column)
   "One aggregate over the rows `q` selects: `(aggregate repo q :sum :bytes)`. `op` is
   `:count` `:sum` `:max` `:min` or `:avg`; nil when no row contributes (except `:count`,
-  which is 0)."
+  which is 0). Over a query with a limit, a distinct, a grouping or a union it is over
+  those rows, read as a subquery — name `column` unqualified then."
   (let (expr (if (nil? column) [op] [op column])
-        row (one repo (query/select (unordered q) [[:as expr :aggregate]])))
+        row (one repo (query/select (over-rows q false) [[:as expr :aggregate]])))
     (get row :aggregate)))
 
 (defn count-rows (repo q)
@@ -158,7 +181,7 @@
 
 (defn exists? (repo q)
   "True when `q` selects at least one row."
-  (not (nil? (one repo (query/select (unordered q) [[:as [:raw "1"] :present]])))))
+  (not (nil? (one repo (query/select (over-rows q false) [[:as [:literal 1] :present]])))))
 
 (defn ping (repo)
   "True when the database answers a trivial query; raises when it does not."

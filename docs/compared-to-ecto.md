@@ -51,7 +51,7 @@ Both refuse the mistakes that would otherwise run and return the wrong rows:
 | `update_all` with a `limit` | runtime error | `update-all` refuses `:limit`, `:order`, `:group` |
 | A value mistaken for SQL | `^` marks values | a value is bound unless it is an expression; a keyword on the right side is an error, since it could be either |
 | A non-unique `get_by` | `MultipleResultsError` | `fetch-by` raises the same way |
-| A cast into SQL | type checked | `[:cast x "int); DROP …"]` is an error: a type name is checked |
+| A cast into SQL | type checked | a type name is words, a precision and `[]` only, so `[:cast x "text), (SELECT …"]` is an error |
 | A fragment with the wrong hole count | compile error | an error naming the fragment |
 
 Ecto catches these at compile time; store catches them when the query compiles to SQL.
@@ -63,18 +63,13 @@ written out.
 - **A query is a value.** Nothing about it is macro-time: a query passed in, stored,
   merged or generated is the same as one written out, and `dynamic/2` has no equivalent
   because it isn't needed.
-- **A fragment's holes are operands.** In `[:fragment "? @@ to_tsquery(?)" :doc q]` the
-  keyword is a column and `q` is bound. An Ecto fragment does the same with `^`, but a
-  store fragment can also take any expression, a subquery included.
-- **`[:literal v]`** writes a constant into the SQL text, quoted and escaped. Postgres
-  only matches a partial index when the query states its predicate literally, and a bound
-  parameter doesn't. Ecto needs a `fragment` for this.
-- **Writes take the read's query.** `update-all` and `delete-all` take the same query a
-  SELECT would — its joins become `FROM` / `USING` — so the condition that lists the rows
-  is the one that changes them.
-- **Constraints are data.** A schema's `:constraints` are named the way Postgres names
-  them, migrations add and drop them, and `changeset/unique-constraint` maps the violation
-  back to a field. Ecto has the changeset half.
+- **Migrations come from the schema.** A schema's `:constraints` are data, named the way
+  Postgres names them, and migrations add and drop them. `changeset/unique-constraint` maps
+  a violation back to a field. Ecto has every piece of this — `create constraint` in a
+  migration, `unique_constraint` in a changeset — but the schema doesn't describe the table,
+  so nothing ties them together.
+- **A row lock is checked data.** `(lock q :update :skip-locked)` refuses an unknown
+  strength or wait. Ecto's `lock:` is a string that goes into the SQL as written.
 - **Migrations are checked against the schema without a database.** `migration/check`
   fails until the migrations build exactly the schemas, and `migration/generate` writes
   the step that closes the gap.
