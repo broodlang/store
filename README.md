@@ -1,7 +1,7 @@
 # store
 
 An **adaptor-agnostic database storage library** for
-[Brood](https://broodlang.org) — like Ecto, a bit better. Queries are plain data
+[Brood](https://github.com/broodlang/brood) — like Ecto, a bit better. Queries are plain data
 (no macro DSL, no pin operator), composed with ordinary functions and compiled
 to parameterized SQL; `schema`, `changeset`, and `repo` build on top. The actual
 database I/O is done by a swappable **adaptor** that implements a small contract,
@@ -37,6 +37,25 @@ Joins, aggregates, upserts and atomic increments are data too — no SQL strings
 (repo/insert my-repo :counts {:k "x" :n 1}
   {:on-conflict {:target [:k] :do {:n [:+ :counts.n [:excluded :n]]}}})
 ```
+
+Subqueries, lateral joins, CTEs (recursive too), unions, windows, `CASE`, JSON paths and a
+parameterised `[:fragment …]` escape hatch are data as well, and a write can take the same
+query a read does:
+
+```brood
+(repo/fetch-by my-repo :users {:email email})          ; nil, the row, or an error if two match
+
+(repo/update-all my-repo
+  (-> (query/from :members :m)
+      (query/join :organisations :o [:= :o.id [:col :m.organisation_id]])
+      (query/where {:o.name "acme"}))
+  {:role "admin"})
+```
+
+A query that cannot mean what it says is an error when it compiles, not a query that
+quietly matches nothing: `[:= :token nil]` (nothing equals NULL; write `[:is-nil :token]`),
+a misspelt key (`:wher`), an unknown order direction. [docs/compared-to-ecto.md](docs/compared-to-ecto.md)
+puts every form next to its Ecto equivalent.
 
 **Changesets** cast form params to the schema's types, validate, and turn a database
 constraint into a field error:
@@ -75,7 +94,7 @@ them in a migration.
 Add it to a project with:
 
 ```bash
-nest add store :version "^0.5.0"
+nest add store :version "^0.6.0"
 ```
 
 ## Publishing

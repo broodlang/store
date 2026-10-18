@@ -118,15 +118,31 @@
   (exec repo (first compiled) (second compiled)))
 
 (defn all (repo q)
-  "Run query `q` and return its rows as maps keyed by column name (keywords)."
+  "Run query `q` — or read every row of a table or schema — and return the rows as maps
+  keyed by column name (keywords)."
   (exec-compiled repo (query/to-sql q)))
 
 (defn one (repo q)
   "Run `q` with LIMIT 1; return the first row map, or nil if none."
-  (first (all repo (query/limit q 1))))
+  (first (all repo (query/limit (query/to-query q) 1))))
+
+(defn fetch-by (repo source condition)
+  "The one row of `source` (a table, a schema or a query) matching `condition` — a map
+  `{:email e}` or an expression — or nil. More than one is an error, not a coin toss: a
+  lookup that is not unique is a bug in the lookup."
+  (let (rows (all repo (-> (query/to-query source) (query/where condition) (query/limit 2))))
+    (when (> (count rows) 1)
+      (error "repo: fetch-by found more than one row for " (pr-str condition)))
+    (first rows)))
+
+(defn fetch (repo source id)
+  "The row of `source` whose primary key is `id` — a schema's `:primary-key`, else `:id` —
+  or nil. A nil `id` is an error: it can match no row."
+  (let (key (if (and (map? source) (contains? source :primary-key)) (get source :primary-key) :id))
+    (fetch-by repo source {key id})))
 
 (defn- unordered (q)
-  (dissoc q :order :limit :offset))
+  (dissoc (query/to-query q) :order :limit :offset))
 
 (defn aggregate (repo q op &optional column)
   "One aggregate over the rows `q` selects: `(aggregate repo q :sum :bytes)`. `op` is
@@ -159,18 +175,31 @@
   (first (exec-compiled repo (query/insert-sql table row opts))))
 
 (defn insert-all (repo table rows &optional (opts {}))
-  "Insert `rows` (each with the same columns) in one statement; return the rows given
-  back. An empty `rows` is no statement at all."
-  (if (empty? rows) [] (exec-compiled repo (query/insert-all-sql table rows opts))))
+  "Insert `rows` (each with the same columns) in one statement — or the rows a query
+  selects, its select a map `{:column expr}` — and return the rows given back. An empty
+  `rows` is no statement at all."
+  (if (and (not (query/query? rows)) (empty? rows))
+    []
+    (exec-compiled repo (query/insert-all-sql table rows opts))))
 
-(defn update (repo table changes where-expr &optional (opts {}))
-  "Set `changes` on rows of `table` matching `where-expr`; return the updated rows. A
-  change may be an expression: `{:downloads [:+ :downloads 1]}`."
-  (exec-compiled repo (query/update-sql table changes where-expr opts)))
+(defn update (repo table changes condition &optional (opts {}))
+  "Set `changes` on rows of `table` matching `condition` (a map `{:id 4}` or an
+  expression); return the updated rows. A change may be an expression: `{:downloads [:+
+  :downloads 1]}`."
+  (exec-compiled repo (query/update-sql table changes condition opts)))
 
-(defn delete (repo table where-expr &optional (opts {}))
-  "Delete rows of `table` matching `where-expr`; return the deleted rows."
-  (exec-compiled repo (query/delete-sql table where-expr opts)))
+(defn delete (repo table condition &optional (opts {}))
+  "Delete rows of `table` matching `condition`; return the deleted rows."
+  (exec-compiled repo (query/delete-sql table condition opts)))
+
+(defn update-all (repo q changes &optional (opts {}))
+  "Set `changes` on every row query `q` selects — its where, its joins, its CTEs (see
+  `query/update-all-sql`); return the updated rows."
+  (exec-compiled repo (query/update-all-sql q changes opts)))
+
+(defn delete-all (repo q &optional (opts {}))
+  "Delete every row query `q` selects (see `query/delete-all-sql`); return them."
+  (exec-compiled repo (query/delete-all-sql q opts)))
 
 ;; ---- changesets ---------------------------------------------------------------
 
@@ -197,7 +226,7 @@
   when it is invalid or a declared constraint (`changeset/unique-constraint` …) fails."
   (persist cs
     :insert (fn ()
-      (let (row (insert repo (source-of cs opts) (changeset/apply-changes cs) opts))
+      (let (row (insert repo (source-of cs opts) (changeset/apply-changes cs) (dissoc opts :table)))
         (if (nil? row) (changeset/apply-changes cs) row)))))
 
 (defn update-changeset (repo cs &optional (opts {}))
@@ -216,7 +245,7 @@
                      (source-of cs opts)
                      (changeset/changes cs)
                      [:= pk key-value]
-                     opts))
+                     (dissoc opts :table)))
           (if (empty? rows)
             (changeset/apply-changes cs)
             (merge (changeset/data cs) (first rows))))))))
