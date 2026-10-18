@@ -30,7 +30,8 @@
   Field specs, indexes and constraints are the `schema` module's. A migration's `:down` is written
   out, or derived: every step above reverses itself when it holds what its reverse needs
   (an `:alter-column` its `:from`, an `:execute` its `down-sql`), and `rollback` refuses a
-  migration that does not.
+  migration that does not. A create made `:if-not-exists` has no reverse: what it found
+  already there (a baseline adopting a deployed schema) is not its to drop.
 
   **Running.** `migrate` takes a database advisory lock first, so two machines booting
   together apply each migration once — the second waits, then finds nothing pending. Each
@@ -134,7 +135,11 @@
   (let (op (first step)
         args (into [] (rest step)))
     (case op
-      :create-table [:drop-table (first args) (second args)]
+      ;; A table or index made only "if not exists" may have been there already — a baseline
+      ;; adopting a deployed schema — so dropping it is not the reverse: such a step has none,
+      ;; and rolling back its migration needs a written `:down`.
+      :create-table
+        (when (not (get (second args) :if-not-exists)) [:drop-table (first args) (second args)])
       :drop-table (when (second args) [:create-table (first args) (second args)])
       :rename-table [:rename-table (second args) (first args)]
       :add-column [:drop-column (first args) (second args) (nth args 2)]
@@ -146,7 +151,9 @@
               changes (nth args 2 nil)
               from (get changes :from))
           (when from [:alter-column table field (assoc from :from (dissoc changes :from :using))]))
-      :create-index [:drop-index (first args) (second args) (nth args 2 nil)]
+      :create-index
+        (when (not (get (nth args 2 nil) :if-not-exists))
+          [:drop-index (first args) (second args) (nth args 2 nil)])
       :drop-index
         (when (map? (second args)) [:create-index (first args) (second args) (nth args 2 nil)])
       :add-constraint [:drop-constraint (first args) (second args)]
@@ -572,6 +579,9 @@
             (error "migration: the database has applied "
               (pr-str unknown)
               ", which this code does not know — roll back with the code that applied them"))
+          ;; every chosen migration's down steps first, so one that cannot be reversed refuses
+          ;; the whole rollback before any of it runs
+          (doseq (m chosen) (down-steps m))
           (doseq (m chosen) (apply-down conn table m log))
           (into [] chosen))))))
 

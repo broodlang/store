@@ -59,6 +59,18 @@
     (is (nil? (migration/reverse-step [:execute "up"])))
     (is (nil? (migration/reverse-step [:drop-column :users :handle])))
     (assert-error (migration/down-steps users-v2)))
+  ;; A baseline adopting a deployed schema creates "if not exists": rolling it back must not
+  ;; drop the tables it found.
+  (test "a create that was only if-not-exists does not reverse into a drop"
+    (is (nil? (migration/reverse-step [:create-table
+                                        :users {:fields {:id :serial} :if-not-exists true}])))
+    (is (nil? (migration/reverse-step [:create-index
+                                        :users {:columns [:email]}
+                                        {:if-not-exists true}])))
+    (assert-error (migration/down-steps {:version 1
+                                         :name "baseline"
+                                         :up [[:create-table
+                                                :users {:fields {:id :serial} :if-not-exists true}]]})))
   (test "down-steps reverses in reverse order"
     (is (= (migration/down-steps users-v1)
           (list [:drop-index :users {:columns [:email] :unique true :name "users_email_idx"} nil]
