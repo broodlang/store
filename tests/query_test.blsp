@@ -157,3 +157,24 @@
   (test "delete-sql"
     (is (= (query/delete-sql :users [:= :id 5])
           ["DELETE FROM \"users\" WHERE \"id\" = $1 RETURNING *" [5]]))))
+
+(describe "query: conflict updates, returning expressions, literals"
+  (test "a conflict update can be limited by a WHERE, and RETURNING takes an expression"
+    (is (= (query/insert-sql :objects
+             {:address "a" :size 3}
+             {:on-conflict {:target [:project_id :address]
+                            :do {:missing false}
+                            :where [:col :objects.missing]}
+              :returning [[:as [:= :xmax 0] :inserted]]})
+          [(str "INSERT INTO \"objects\" (\"address\", \"size\") VALUES ($1, $2) "
+             "ON CONFLICT (\"project_id\", \"address\") DO UPDATE SET \"missing\" = $3 "
+             "WHERE \"objects\".\"missing\" RETURNING (\"xmax\" = $4) AS \"inserted\"")
+            ["a" 3 false 0]]))
+    (is (= (first (query/update-sql :t {:n 1} [:= :id 2] {:returning [:id [:as [:+ :n 1] :next]]}))
+          "UPDATE \"t\" SET \"n\" = $1 WHERE \"id\" = $2 RETURNING \"id\", (\"n\" + $3) AS \"next\"")))
+  (test "a literal is in the text, quoted and escaped, and binds nothing"
+    (is (= (query/to-sql (-> (query/from :p) (query/where [:like :name [:literal "change/%"]])))
+          ["SELECT * FROM \"p\" WHERE \"name\" LIKE 'change/%'" []]))
+    (is (= (first (query/to-sql (-> (query/from :p) (query/where [:= :name [:literal "it's"]]))))
+          "SELECT * FROM \"p\" WHERE \"name\" = 'it''s'"))
+    (assert-error (query/to-sql (-> (query/from :p) (query/where [:= :name [:literal [1]]]))))))

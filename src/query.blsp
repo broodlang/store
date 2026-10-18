@@ -38,6 +38,7 @@
     [:count] [:count col] [:count-distinct col] [:sum col] [:max col] [:min col] [:avg col]
     [:coalesce a b …] [:lower a] [:upper a]
     [:as expr :alias]             ; name a selected expression
+    [:literal \"change/%\"]       ; a value IN the SQL text, quoted — where a planner needs it
     [:raw \"sql\"]                  ; the escape hatch — a literal SQL fragment
 
   Identifiers are double-quoted (`:users.id` → `\"users\".\"id\"`), so a column may be
@@ -155,11 +156,24 @@
   #{:=
     :<> :!= :> :>= :< :<= :and :or :not :in :not-in :any :like :ilike :is-nil :not-nil :exists :col
     :excluded :+ :- :* :/ :count :count-distinct :sum :max :min :avg :coalesce :lower :upper
-    :as :raw})
+    :as :literal :raw})
 
 (defn expression? (x)
   "True when `x` is a query expression — a vector headed by a known operator."
   (and (vector? x) (not (empty? x)) (contains? operators (first x))))
+
+;; `[:literal v]` puts a value into the SQL text instead of binding it — quoted and escaped,
+;; so it is still never mistaken for SQL. For where the planner must see the constant: a
+;; partial index's `WHERE name LIKE 'change/%'` matches only a query that says the same
+;; literal, which a bound parameter does not once Postgres plans the statement generically.
+(defn- literal-sql (value)
+  (cond
+    (nil? value) "NULL"
+    (= value true) "TRUE"
+    (= value false) "FALSE"
+    (int? value) (str value)
+    (string? value) (str "'" (string/replace value "'" "''") "'")
+    :else (error "query: a :literal is a string, an integer, a boolean or nil, not " (pr-str value))))
 
 (defn- bind (value params)
   [(placeholder params) (conj params value)])
@@ -264,6 +278,7 @@
         (= op :as)
           (let ([sql next] (compile-operand (first args) params))
             [(str sql " AS " (ident (second args))) next])
+        (= op :literal) [(literal-sql (first args)) params]
         (= op :raw) [(first args) params]
         :else (error "query: unknown operator " (pr-str op))))))
 
@@ -346,14 +361,19 @@
 
 ;; ---- DML: insert / update / delete (data in, [sql params] out) --------------
 ;; Every statement takes an `opts` map. `:returning` is `:all` (the default, RETURNING *),
-;; a vector of columns, or `:none` — a row holding a large `bytea` need not come back.
+;; a vector of columns and expressions, or `:none` — a row holding a large `bytea` need not
+;; come back.
 
-(defn- returning-sql (opts)
+(defn- returning-sql (opts params)
+  "The RETURNING clause and the params after it: `:all` (the default), `:none`, or a vector
+  of columns and expressions — `[:id [:as [:= :xmax 0] :inserted]]`."
   (let (returning (get opts :returning :all))
     (cond
-      (= returning :all) " RETURNING *"
-      (= returning :none) ""
-      :else (str " RETURNING " (string/join (map returning ident) ", ")))))
+      (= returning :all) [" RETURNING *" params]
+      (= returning :none) ["" params]
+      :else
+        (let ([sqls next] (compile-list returning params compile-operand))
+          [(str " RETURNING " (string/join sqls ", ")) next]))))
 
 (defn- compile-assignments (changes params)
   (compile-list (keys changes)
@@ -364,7 +384,8 @@
 
 (defn- conflict-sql (conflict params)
   "The ON CONFLICT clause of an insert. `conflict` is
-  `{:target [:col …] | :constraint \"name\", :do :nothing | :replace [:col …] | {:col expr}}`
+  `{:target [:col …] | :constraint \"name\", :do :nothing | :replace [:col …] | {:col expr}, :where expr}`
+  — `:where` limits which conflicting rows a map's update touches (`[:col :t.missing]`);
   — `:replace` takes each column from the proposed row, a map sets arbitrary expressions
   (`{:objects [:+ :mur_object_counts.objects [:excluded :objects]]}`)."
   (if (nil? conflict)
@@ -385,8 +406,12 @@
              (string/join (map action (fn (c) (str (ident c) " = EXCLUDED." (ident c)))) ", "))
             params]
         (map? action)
-          (let ([sqls next] (compile-assignments action params))
-            [(str " ON CONFLICT" target " DO UPDATE SET " (string/join sqls ", ")) next])
+          (let ([sqls after-set] (compile-assignments action params)
+                [where-sql next] (if (nil? (get conflict :where))
+                                   ["" after-set]
+                                   (let ([sql after] (compile-expr (get conflict :where) after-set))
+                                     [(str " WHERE " sql) after])))
+            [(str " ON CONFLICT" target " DO UPDATE SET " (string/join sqls ", ") where-sql) next])
         :else (error "query: bad :on-conflict :do " (pr-str action))))))
 
 (defn insert-all-sql (table rows &optional (opts {}))
@@ -401,7 +426,8 @@
                                                       current
                                                       (fn (c p) (compile-value (get row c) p))))
                                     [(str "(" (string/join sqls ", ") ")") next])))
-        [conflict params] (conflict-sql (get opts :on-conflict) after-values))
+        [conflict after-conflict] (conflict-sql (get opts :on-conflict) after-values)
+        [returning params] (returning-sql opts after-conflict))
     (when (and (empty? columns) (> (count rows) 1))
       (error "query: insert-all-sql: several rows with no columns — insert them one at a time"))
     [(str "INSERT INTO "
@@ -411,7 +437,7 @@
          " DEFAULT VALUES"
          (str " (" (string/join (map columns ident) ", ") ") VALUES " (string/join tuples ", ")))
        conflict
-       (returning-sql opts))
+       returning)
       params]))
 
 (defn insert-sql (table row &optional (opts {}))
@@ -422,17 +448,13 @@
   "UPDATE `table` SET `changes` WHERE `where-expr`. A change's value may be an
   expression — `{:downloads [:+ :downloads 1]}` increments atomically."
   (let ([sqls after-set] (compile-assignments changes [])
-        [where-sql params] (compile-expr where-expr after-set))
-    [(str "UPDATE "
-       (ident table)
-       " SET "
-       (string/join sqls ", ")
-       " WHERE "
-       where-sql
-       (returning-sql opts))
+        [where-sql after-where] (compile-expr where-expr after-set)
+        [returning params] (returning-sql opts after-where))
+    [(str "UPDATE " (ident table) " SET " (string/join sqls ", ") " WHERE " where-sql returning)
       params]))
 
 (defn delete-sql (table where-expr &optional (opts {}))
   "DELETE FROM `table` WHERE `where-expr`."
-  (let ([where-sql params] (compile-expr where-expr []))
-    [(str "DELETE FROM " (ident table) " WHERE " where-sql (returning-sql opts)) params]))
+  (let ([where-sql after-where] (compile-expr where-expr [])
+        [returning params] (returning-sql opts after-where))
+    [(str "DELETE FROM " (ident table) " WHERE " where-sql returning) params]))
