@@ -286,8 +286,18 @@
 
 ;; ---- diffing: model → schemas ----------------------------------------------------------
 
+(defn- source-spec (normal)
+  "A normalised field spec back in the short form a schema is written in — `:text`, or
+  `[:text {:null false}]` — so a generated migration reads like the code beside it."
+  (let (type (keyword (get normal :type))
+        opts (dissoc normal :type))
+    (if (empty? opts) type [type opts])))
+
 (defn- definition-of (t)
-  {:primary-key (get t :primary-key) :fields (get t :fields)})
+  {:primary-key (get t :primary-key)
+   :fields (reduce (keys (get t :fields))
+             {}
+             (fn (acc f) (assoc acc f (source-spec (get (get t :fields) f)))))})
 
 (defn- index-steps (table have want)
   (append (map (seq/filter (keys have) (fn (name) (not (= (get have name) (get want name)))))
@@ -302,20 +312,29 @@
                     (if (= (get have k) (get want k))
                       acc
                       (assoc acc
-                        k (case k :null (if (= (get want k) false) false true) (get want k))))))
+                        k
+                          (case k
+                            :null (if (= (get want k) false) false true)
+                            :type (keyword (get want k))
+                            (get want k))))))
         from (reduce (keys changes)
                {}
                (fn (acc k)
-                 (assoc acc k (case k :null (if (= (get have k) false) false true) (get have k))))))
+                 (assoc acc
+                   k
+                     (case k
+                       :null (if (= (get have k) false) false true)
+                       :type (keyword (get have k))
+                       (get have k))))))
     [:alter-column table field (assoc changes :from from)]))
 
 (defn- table-steps (table have want)
   (let (have-fields (get have :fields)
         want-fields (get want :fields)
         added (map (seq/filter (sort (keys want-fields)) (fn (f) (not (contains? have-fields f))))
-                (fn (f) [:add-column table f (get want-fields f)]))
+                (fn (f) [:add-column table f (source-spec (get want-fields f))]))
         dropped (map (seq/filter (sort (keys have-fields)) (fn (f) (not (contains? want-fields f))))
-                  (fn (f) [:drop-column table f (get have-fields f)]))
+                  (fn (f) [:drop-column table f (source-spec (get have-fields f))]))
         altered (map (seq/filter (sort (keys want-fields))
                        (fn (f)
                          (and (contains? have-fields f)

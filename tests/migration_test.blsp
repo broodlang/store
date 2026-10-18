@@ -74,7 +74,7 @@
     (is (= (migration/check [users-v1 users-v2] [users-schema]) [])))
   (test "check names what the migrations lack"
     (is (= (migration/check [users-v1] [users-schema])
-          [[:add-column :users :handle {:type "text" :null false}]])))
+          [[:add-column :users :handle [:text {:null false}]]])))
   (test "a changed column is an alter with its :from, so it reverses"
     (is (= (migration/check [users-v1 users-v2]
              [(assoc users-schema :fields (assoc (get users-schema :fields) :handle :text))])
@@ -105,3 +105,24 @@
             "ALTER TABLE \"users\" ALTER COLUMN \"handle\" SET NOT NULL"))))
   (test "version-now is a 14-digit timestamp"
     (is (= (string/length (str (migration/version-now))) 14))))
+
+(describe "migration: generated migrations round-trip"
+  (test "a generated migration builds exactly the schema it came from"
+    (let (orgs {:table :orgs
+                :primary-key :id
+                :fields {:id :serial
+                         :name [:text {:null false :default "x"}]
+                         :owner [:integer {:references :users}]}
+                :indexes [{:columns [:name] :unique true}
+                           {:columns [:owner] :where [:not-nil :owner]}]}
+          created (migration/generate [] [orgs] "orgs" 1)
+          moved (assoc orgs :fields (assoc (get orgs :fields) :name :text :size :bigint))
+          altered (migration/generate [created] [moved] "orgs-size" 2))
+      (is (= (migration/check [created] [orgs]) []))
+      (is (= (migration/check [created altered] [moved]) []))
+      (is (= (get (first (get created :up)) 2)
+            {:primary-key :id
+             :fields {:id :serial
+                      :name [:text {:null false :default "x"}]
+                      :owner [:integer {:references :users}]}}))
+      (is (= (migration/check [] []) [])))))
