@@ -70,7 +70,7 @@
   "Raise on a malformed migration list — a missing or repeated version, an unknown step,
   a concurrent index inside a transaction — so a typo fails at boot, not halfway through a
   deploy. Returns the migrations sorted by version."
-  (let (sorted (sort-by migrations (fn (m) (get m :version))))
+  (let (sorted (seq/sort-by migrations (fn (m) (get m :version))))
     (fold sorted
       nil
       (fn (previous m)
@@ -603,7 +603,7 @@
                     :state (if (contains? done (get m :version)) :up :down)}))
         missing (map (seq/filter rows (fn (row) (not (contains? known (get row :version)))))
                   (fn (row) {:version (get row :version) :name (get row :name) :state :missing})))
-    (sort-by (append listed missing) (fn (entry) (get entry :version)))))
+    (seq/sort-by (append listed missing) (fn (entry) (get entry :version)))))
 
 (defn plan (migrations versions-applied)
   "The SQL `migrate` would run against a database holding `versions-applied` — a dry
@@ -625,7 +625,7 @@
   "The whole number after `--name` in `arguments`, or nil when the flag is absent. A flag
   given without one is refused rather than read as absent: `down --to` with its version
   missing must not quietly become `down`, which rolls back the newest migration."
-  (let (tail (drop-while (into [] arguments) (fn (a) (not (= a (str "--" name)))))
+  (let (tail (seq/drop-while (into [] arguments) (fn (a) (not (= a (str "--" name)))))
         value (when (> (count tail) 1) (string/->number (second tail))))
     (cond
       (empty? tail) nil

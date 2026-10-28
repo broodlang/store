@@ -110,7 +110,7 @@
         " has no "
         (string/join (map unknown pr-str) ", ")
         " — a query's keys are "
-        (pr-str (sort-by (into [] allowed) ->string))))))
+        (pr-str (seq/sort-by (into [] allowed) ->string))))))
 
 ;; ---- builders (each returns a fresh query map) ------------------------------
 
@@ -130,7 +130,7 @@
   (assoc q :select columns))
 
 (defn- sorted-keys (m)
-  (sort-by (keys m) ->string))
+  (seq/sort-by (keys m) ->string))
 
 (defn- select-terms (columns)
   "A select as a vector of terms — a map's entries become `[:as expr alias]`."
@@ -184,7 +184,7 @@
     (error "query: "
       context
       " is one of "
-      (pr-str (sort-by (keys table) ->string))
+      (pr-str (seq/sort-by (keys table) ->string))
       ", not "
       (pr-str kind))))
 
@@ -261,7 +261,7 @@
 (defn- check-direction (direction)
   (when (not (contains? directions direction))
     (error "query: an order direction is one of "
-      (pr-str (sort-by (keys directions) ->string))
+      (pr-str (seq/sort-by (keys directions) ->string))
       ", not "
       (pr-str direction))))
 

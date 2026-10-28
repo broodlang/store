@@ -870,7 +870,7 @@ code paints to a terminal or a GUI window unchanged.
   `(frame (clear) (text row col s face?) (cursor row col))`. A *face* is a style
   map, `{:fg :red :bold true}` (`(:use editor/display)` for the constructors).
 - **Frontend** = a map of five fns `{:enter :leave :size :draw :poll}`. `(:use editor/ui)`
-  gives you `*term-display*` (the terminal) and `(gui-display)` (a native window,
+  gives you `editor/ui/*term-display*` (the terminal) and `(gui-display)` (a native window,
   needs a `--features gui` build); `display-broadcast` fans one frame to several.
 - **The loop** = `(ui-run model view update display)` — a TEA loop: render
   `(view model cols rows)` → poll input → fold it with `(update model input cols
@@ -902,7 +902,7 @@ code paints to a terminal or a GUI window unchanged.
         (= input :ctrl-c) (assoc m :done true)   ; Esc/Ctrl-C → quit
         else m))
 
-(defn main () (ui-run {:count 0 :done false :tick-ms 1000} view update *term-display*))
+(defn main () (ui-run {:count 0 :done false :tick-ms 1000} view update editor/ui/*term-display*))
 ;; for a window instead: (ui-run … (gui-display))   ; --features gui
 ```
 
@@ -1386,7 +1386,7 @@ Testing processes: **never `sleep` to wait for another process** — a loaded ma
 outsleeps any guess. Wait for the event: a message the other side sends, a monitor's
 `[:down …]`, or, when nothing announces it, `(eventually "what" probe)` (polls a
 zero-argument fn until truthy) / `(await-parked pid)`. Bound a wait for an expected
-message with `(receive … (after *test-wait-ms* :timeout))`; a test that hangs anyway is
+message with `(receive … (after test/*wait-ms* :timeout))`; a test that hangs anyway is
 killed and its report says what it was stuck on.
 
 `nest test` runs each test in its own green process. `nest run` invokes the
