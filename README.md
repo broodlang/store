@@ -10,10 +10,7 @@ so the library depends on no specific driver — e.g.
 
 ## Usage
 
-```brood
-(:alias query)
-(:alias repo)
-
+```brood fragment
 ;; queries are data, composed with plain functions
 (-> (query/from :users)
     (query/where [:ilike :name "%ada%"])
@@ -27,7 +24,7 @@ so the library depends on no specific driver — e.g.
 
 Joins, aggregates, upserts and atomic increments are data too — no SQL strings:
 
-```brood
+```brood fragment
 (-> (query/from :organisations :o)
     (query/select [:o.name [:as [:count] :members]])
     (query/join :members :m [:= :m.organisation_id [:col :o.id]])
@@ -42,7 +39,7 @@ Subqueries, lateral joins, CTEs (recursive too), unions, windows, `CASE`, JSON p
 parameterised `[:fragment …]` escape hatch are data as well, and a write can take the same
 query a read does:
 
-```brood
+```brood fragment
 (repo/fetch-by my-repo :users {:email email})          ; nil, the row, or an error if two match
 
 (repo/update-all my-repo
@@ -60,7 +57,7 @@ puts every form next to its Ecto equivalent.
 **Changesets** cast form params to the schema's types, validate, and turn a database
 constraint into a field error:
 
-```brood
+```brood fragment
 (let (cs (-> (changeset/cast {} params [:email :age] users-schema)
              (changeset/validate-required [:email])
              (changeset/validate-number :age {:greater-than-or-equal-to 0})
@@ -74,7 +71,7 @@ constraint into a field error:
 `schema_migrations`; `migration/check` proves (with no database) that they build the
 app's schemas, and `migration/generate` writes the one that closes a gap:
 
-```brood
+```brood fragment
 (def all
   [{:version 20261018090000
     :name "users"
