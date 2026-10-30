@@ -1309,15 +1309,12 @@
         (nil? (column-of (first arguments) aliases))
         (not (nil? (column-of (second arguments) aliases))))
         [operator (second operands) (first operands)]
-      ;; `in` over a subquery is IN; over values it is one bound array, `= ANY`
-      (= operator :in)
+      ;; `in` over a query is IN (SELECT …); over values one bound array, `= ANY` — decided as
+      ;; the query is made (`membership`), so a query held in a local is a subquery too
+      (includes? [:in :not-in] operator)
         (if (from-form? (second arguments))
-          [:in (first operands) (second operands)]
-          [:any (first operands) (second operands)])
-      (= operator :not-in)
-        (if (from-form? (second arguments))
-          [:not-in (first operands) (second operands)]
-          [:not [:any (first operands) (second operands)]])
+          [operator (first operands) (second operands)]
+          `(membership ~operator ~(first operands) ~(second operands)))
       ;; one left out (`when`, or a Brood value that is nil) is no condition, not a false one
       (includes? [:and :or] operator) `(junction ~operator ~operands)
       :else (into [operator] operands))))
@@ -1422,3 +1419,11 @@
       (empty? kept) nil
       (= (count kept) 1) (first kept)
       :else (into [operator] kept))))
+
+(defn membership (operator column values)
+  "`from`'s `(in column values)` (or `not-in`): IN a subquery when `values` is a query, else
+  one bound array (`= ANY`), so a list of any length is one statement."
+  (cond
+    (query? values) [operator column values]
+    (= operator :in) [:any column values]
+    :else [:not [:any column values]]))

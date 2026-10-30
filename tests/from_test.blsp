@@ -132,6 +132,15 @@
       (assert= (first (sql (query/from r :runners :lock :share)))
         "SELECT * FROM \"runners\" AS \"r\" FOR SHARE")))
 
+  (test "in over a query held in a local is a subquery; over a list one array"
+    (let (admins (query/from m :members :where (= m.role "admin") :select m.user_id)
+          ids [1 2])
+      (assert= (first (sql (query/from u :users :where (in u.id admins))))
+        (str "SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" IN "
+          "(SELECT \"m\".\"user_id\" FROM \"members\" AS \"m\" WHERE \"m\".\"role\" = 'admin')"))
+      (assert= (first (sql (query/from u :users :where (not-in u.id ids))))
+        "SELECT * FROM \"users\" AS \"u\" WHERE NOT (\"u\".\"id\" = ANY($1))")))
+
   (test "an unknown clause is an error when it is expanded"
     (assert (includes? (get (try (reflect/eval-string "(query/from u :users :wher 1)") (catch e e))
                          :message)
