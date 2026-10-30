@@ -485,7 +485,7 @@
 
 (defn- versions-in (conn table)
   (into #{}
-    (map (repo/all conn (-> (query/from table) (query/select [:version])))
+    (map (repo/all conn (-> (query/table table) (query/select [:version])))
       (fn (row) (get row :version)))))
 
 (defn applied (repo &optional (opts {}))
@@ -493,7 +493,7 @@
   (repo/with-connection repo
     (fn (conn)
       (ensure-table conn (history opts))
-      (repo/all conn (-> (query/from (history opts)) (query/order-by :version))))))
+      (repo/all conn (-> (query/table (history opts)) (query/order-by :version))))))
 
 (defn- run-steps (conn steps log)
   (doseq (step steps)

@@ -77,3 +77,15 @@
   (test "nothing is emitted and nothing breaks when telemetry is not running"
     (telemetry/stop)
     (assert= [] (repo/exec (repo/open (fake-adaptor []) {}) "SELECT 1" []))))
+
+(describe "value and column"
+  (test "value is the one column of the first row, nil for none"
+    (assert= (repo/value (repo/open (fake-adaptor [{:email "a@b.c"}]) {}) :users) "a@b.c")
+    (assert= (repo/value (repo/open (fake-adaptor []) {}) :users) nil))
+  (test "column is that column of every row"
+    (assert= (repo/column (repo/open (fake-adaptor [{:id 1} {:id 2}]) {}) :users) [1 2]))
+  (test "a row of several columns has no one value"
+    (assert (includes? (get (try (repo/value (repo/open (fake-adaptor [{:a 1 :b 2}]) {}) :users)
+                              (catch e e))
+                         :message)
+              "one column"))))

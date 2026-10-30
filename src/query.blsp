@@ -1,23 +1,28 @@
 (defmodule query
-  "Queries as plain data — the \"better than Ecto\" core. A query is just a map you
-  build and compose with ordinary functions (no macro DSL, no pin operator); it
-  compiles to parameterized SQL + a params vector, and is fully inspectable
-  (`println` it) and dynamically buildable (`if`/`cond`/`reduce` over it like any map).
+  "Queries as plain data — the \"better than Ecto\" core. A query is a map; write it with
+  `from`, which reads as the rest of a program does, and build on it with ordinary functions.
+  It compiles to parameterized SQL + a params vector, and is fully inspectable (`println` it)
+  and dynamically buildable (`if`/`cond`/`reduce` over it like any map).
 
-    (-> (from :users)
-        (where {:email email})         ; email is bound server-side as $1
-        (where [:> :age 18])           ; conjoined with AND
-        (order-by :name)
-        (limit 10))
-    ;; => {:from :users :where [:and [:= :email …] [:> :age 18]]
-    ;;     :order [[:name :asc]] :limit 10}
+    (from u :users
+      :where (and (= u.email email) (> u.age 18))   ; email bound as $1; 18 is in the SQL
+      :order-by u.name
+      :limit 10)
+
+  `u.name` is a column of the table `u` names; anything that is not a column, an operator or
+  a function of a column is a Brood value, bound as a parameter (`from` says the rules). The
+  builders below make the same maps one step at a time, for a query put together in parts:
+
+    (-> (table :users :u)
+        (where [:= :u.email email])
+        (order-by :u.name))
 
   `(to-sql q)` → `[\"SELECT … WHERE … LIMIT …\" [params…]]`. Run it with `repo/all` /
   `repo/one`. A query is checked as it compiles: a key it does not know (`:wher`), an
   ORDER direction it does not know, and a comparison that can never be true are errors
   rather than a query that quietly means something else.
 
-  A query starts `from` a table (a keyword or string), a schema map (its `:table`), or
+  A query starts at a `table` (a keyword or string), a schema map (its `:table`), or
   another query under an alias — a subquery in FROM. Joins take the same sources:
   `join`, `left-join`, `right-join`, `full-join`, `cross-join`, `lateral-join`,
   `left-lateral-join`. `with-cte` / `with-recursive-cte` name a query for the rest to
@@ -114,13 +119,13 @@
 
 ;; ---- builders (each returns a fresh query map) ------------------------------
 
-(defn from (source &optional table-alias)
+(defn table (source &optional table-alias)
   "Start a query against `source`: a table (a keyword or string), a schema map (its
   `:table`), or a query — a subquery in FROM, which needs `table-alias`. The alias is
-  what columns and joins then call it: `(from :organisations :o)` → `:o.id`."
+  what columns and joins then call it: `(table :organisations :o)` → `:o.id`."
   (let (table (table-of source))
     (when (and (query? table) (nil? table-alias))
-      (error "query: a subquery in FROM needs an alias — (from subquery :name)"))
+      (error "query: a subquery in FROM needs an alias — (table subquery :name)"))
     (if (nil? table-alias) {:from table} {:from table :as table-alias})))
 
 (defn select (q columns)
@@ -308,7 +313,7 @@
 
 (defn with-cte (q name subquery)
   "WITH `name` AS (`subquery`) — name a query the rest of `q` reads as a table
-  (`(from :name)`, a join). Several are evaluated in the order added."
+  (`(table :name)`, a join). Several are evaluated in the order added."
   (add-cte q name subquery false))
 
 (defn with-recursive-cte (q name subquery)
@@ -1053,11 +1058,11 @@
 
 (defn- check-condition (condition context)
   "A write's condition must name something: nil, `{}` or an `[:and]` of nothing — a filter
-  that came out empty — would change every row. `update-all` / `delete-all` over `(from :t)` say that."
+  that came out empty — would change every row. `update-all` / `delete-all` over `(table :t)` say that."
   (when (every-row? condition)
     (error "query: "
       context " with no condition would change every row — "
-      "use update-all-sql / delete-all-sql over (from table) to mean that")))
+      "use update-all-sql / delete-all-sql over (table table) to mean that")))
 
 (defn update-sql (table changes condition &optional (opts {}))
   "UPDATE `table` SET `changes` WHERE `condition` (an expression or a map). A change's
@@ -1155,3 +1160,230 @@
         [where-sql after-where] (compile-clause " WHERE " condition after-using)
         [returning params] (returning-sql opts after-where (write-star q)))
     [(str with-sql "DELETE FROM " target using-sql where-sql returning) params]))
+
+;; ---- from: a query written as Brood -----------------------------------------
+;;
+;; `(from o :mur_operations :where (= o.pointer pointer) :select o.uploaded_by)` is the query
+;; the builders above make, written the way the rest of the program is. The first symbol names
+;; the table, and every `o.column` in the clauses is that column; `:join p :t on` names
+;; another. In a clause a form is SQL when its head is one of the operators below (`=` `and`
+;; `like` `nil?` `in` …) or a function of a column (`count` `max` `lower` …); anything else —
+;; a local, `(get user :id)`, `(str "env/" name)` — is a Brood value, worked out as the query is
+;; made and bound as a parameter, so it is never SQL. A string or number written in the clause
+;; itself is put in the SQL text (`[:literal …]`): it is the program's, not a value from
+;; outside, and a planner needs it to use an index on `name LIKE 'change/%'`. A `(from …)`
+;; inside a clause is a subquery, which may name the aliases around it.
+;;
+;; The expansion is the same plain query map the builders return, so a `from` can be built on
+;; further with them (`(where (from …) …)`), printed, and run with `repo/all` and the rest.
+
+;; Each operator a clause may use, by the name it has in Brood, and the query's name for it.
+(def- *predicate-operators*
+  {'= :=
+   'not= :<>
+   '< :<
+   '> :>
+   '<= :<=
+   '>= :>=
+   'and :and
+   'or :or
+   'not :not
+   'between :between
+   'like :like
+   'ilike :ilike
+   'not-like :not-like
+   'not-ilike :not-ilike
+   'nil? :is-nil
+   'some? :not-nil
+   'exists :exists
+   'distinct-from :distinct-from
+   'not-distinct-from :not-distinct-from
+   'in :in
+   'not-in :not-in})
+
+;; The functions a clause may use: SQL only when the form names a column (or is `(count)`), as
+;; `(count ids)` or `(+ n 1)` over Brood values is Brood's.
+(def- *function-operators*
+  {'count :count
+   'count-distinct :count-distinct
+   'sum :sum
+   'max :max
+   'min :min
+   'avg :avg
+   'coalesce :coalesce
+   'lower :lower
+   'upper :upper
+   'greatest :greatest
+   'least :least
+   'nullif :nullif
+   '+ :+
+   '- :-
+   '* :*
+   '/ :/
+   'cast :cast
+   'call :call})
+
+;; Each clause `from` takes, and how many forms follow it.
+(def- *from-clauses*
+  {:where 1
+   :select 1
+   :order-by 1
+   :group-by 1
+   :having 1
+   :limit 1
+   :offset 1
+   :distinct 1
+   :join 3
+   :left-join 3
+   :union 1
+   :union-all 1})
+
+(defn- column-of (form aliases)
+  "The column `form` names, as a keyword, when it is a symbol `alias.column` for one of
+  `aliases` (their names); else nil."
+  (when (symbol? form)
+    (let (text (->string form)
+          dot (index-of text "."))
+      (when (and (> dot 0) (includes? aliases (string/substring text 0 dot))) (keyword text)))))
+
+(defn- names-column? (form aliases)
+  (cond
+    (not (nil? (column-of form aliases))) true
+    (or (list? form) (vector? form)) (any? form (fn (part) (names-column? part aliases)))
+    :else false))
+
+(defn- written-constant? (form)
+  (or (string? form) (int? form) (= form true) (= form false)))
+
+(defn- from-form? (form)
+  "Whether `form` is a nested `(from …)`, written bare or qualified (`query/from`)."
+  (and (list? form)
+    (not (empty? form))
+    (symbol? (first form))
+    (let (name (->string (first form))) (or (= name "from") (string/ends-with? name "/from")))))
+
+(defn- clause-code (form aliases)
+  "The code for one operand or condition of a clause: an expression vector where `form` is SQL
+  (a column, an operator, a function of a column, a subquery), the constant where it is one
+  written there, and `form` itself — a Brood value — otherwise."
+  (let (column (column-of form aliases))
+    (cond
+      (not (nil? column)) [:col column]
+      (written-constant? form) [:literal form]
+      (from-form? form) (from-code (nth form 1) (nth form 2) (drop form 3) aliases)
+      (and (list? form) (not (empty? form)) (symbol? (first form)))
+        (let (head (first form)
+              arguments (into [] (rest form))
+              operator (get *predicate-operators* head))
+          (cond
+            (not (nil? operator)) (predicate-code operator arguments aliases)
+            (and (contains? *function-operators* head)
+              (or (names-column? form aliases) (and (= head 'count) (empty? arguments))))
+              (into [(get *function-operators* head)]
+                (map arguments (fn (argument) (clause-code argument aliases))))
+            :else form))
+      :else form)))
+
+(defn- predicate-code (operator arguments aliases)
+  (let (operands (into [] (map arguments (fn (argument) (clause-code argument aliases)))))
+    (cond
+      ;; a value on the left and a column on the right reads the same turned round, and the
+      ;; left is where the compiler takes a keyword for a column
+      (and (includes? [:= :<>] operator)
+        (= (count arguments) 2)
+        (nil? (column-of (first arguments) aliases))
+        (not (nil? (column-of (second arguments) aliases))))
+        [operator (second operands) (first operands)]
+      ;; `in` over a subquery is IN; over values it is one bound array, `= ANY`
+      (= operator :in)
+        (if (from-form? (second arguments))
+          [:in (first operands) (second operands)]
+          [:any (first operands) (second operands)])
+      (= operator :not-in)
+        (if (from-form? (second arguments))
+          [:not-in (first operands) (second operands)]
+          [:not [:any (first operands) (second operands)]])
+      :else (into [operator] operands))))
+
+(defn- select-code (form aliases)
+  (cond
+    (map? form) (into {} (map (keys form) (fn (key) [key (clause-code (get form key) aliases)])))
+    (vector? form) (into [] (map form (fn (part) (clause-code part aliases))))
+    :else [(clause-code form aliases)]))
+
+(defn- order-steps (form aliases)
+  "One `order-by` step for each term of `form`: a column or expression, or `(desc …)` /
+  `(asc …)` of one."
+  (map (if (vector? form) form [form])
+    (fn (term)
+      (if (and (list? term) (includes? ['desc 'asc] (first term)))
+        `(order-by ~(clause-code (second term) aliases) ~(keyword (->string (first term))))
+        `(order-by ~(clause-code term aliases))))))
+
+(defn- clause-pairs (clauses & found)
+  "`clauses` as `[keyword forms]` pairs, each keyword with as many forms as it takes."
+  (let (so-far (if (empty? found) [] (first found)))
+    (if (empty? clauses)
+      so-far
+      (let (key (first clauses)
+            wanted (get *from-clauses* key))
+        (when (nil? wanted)
+          (error "from: "
+            (pr-str key)
+            " is not a clause; they are "
+            (pr-str (seq/sort-by (keys *from-clauses*) ->string))))
+        (when (< (count (rest clauses)) wanted)
+          (error "from: " (pr-str key) " takes " wanted " form" (if (= wanted 1) "" "s")))
+        (clause-pairs (drop clauses (+ 1 wanted))
+          (conj so-far [key (into [] (take (rest clauses) wanted))]))))))
+
+(defn- clause-steps (key forms aliases)
+  (let (form (first forms))
+    (match key
+      (:where [`(where ~(clause-code form aliases))])
+      (:select [`(select ~(select-code form aliases))])
+      (:order-by (order-steps form aliases))
+      (:group-by [`(group-by ~(select-code form aliases))])
+      (:having [`(having ~(clause-code form aliases))])
+      (:limit [`(limit ~form)])
+      (:offset [`(offset ~form)])
+      (:distinct (if form [`(distinct)] []))
+      (:join [`(join ~(nth forms 1)
+                 ~(keyword (->string (nth forms 0))) ~(clause-code (nth forms 2) aliases))])
+      (:left-join [`(left-join ~(nth forms 1)
+                      ~(keyword (->string (nth forms 0))) ~(clause-code (nth forms 2) aliases))])
+      (:union [`(union ~(clause-code form aliases))])
+      (:union-all [`(union-all ~(clause-code form aliases))]))))
+
+(defn- from-code (alias source clauses outer)
+  "The code `(from alias source & clauses)` expands to, inside a query whose aliases are
+  `outer`."
+  (when (not (symbol? alias))
+    (error "from: the first form names the table, as a symbol — (from o :mur_operations …), not "
+      (pr-str alias)))
+  (let (pairs (clause-pairs clauses)
+        joined (map (seq/filter pairs (fn (pair) (includes? [:join :left-join] (first pair))))
+                 (fn (pair) (->string (first (second pair)))))
+        aliases (into (into [(->string alias)] joined) outer)
+        steps (apply append
+                (map pairs (fn (pair) (clause-steps (first pair) (second pair) aliases)))))
+    `(-> (table ~source ~(keyword (->string alias))) ~@steps)))
+
+(defmacro from (alias source & clauses)
+  "A query, written as Brood: `alias` (a symbol) names `source` (a table keyword, or a schema),
+  and the clauses — `:where`, `:select`, `:order-by`, `:group-by`, `:having`, `:limit`,
+  `:offset`, `:distinct`, `:join alias source on`, `:left-join …`, `:union`, `:union-all` —
+  say the rest. In them `alias.column` is a column, an operator (`=` `not=` `<` `and` `or`
+  `not` `like` `nil?` `some?` `in` `exists` `between` …) or a function of a column (`count`
+  `max` `lower` `coalesce` `cast` …) is SQL, a string or number written there is a constant in
+  the SQL, and every other form is a Brood value, bound as a parameter. `(in col values)` is
+  one bound array (`= ANY`); `(in col (from …))` a subquery. `:select` is one term, a vector of
+  them, or a map of names to terms; `:order-by` a term or a vector, each `(desc …)` or not.
+
+    (from o :mur_operations
+      :where (and (= o.project_id project-id) (= o.pointer (str \"submitted/\" change)))
+      :order-by o.id
+      :select o.uploaded_by)
+
+  The result is a query map, the same the builders make (`table`, `where` …)."
+  (from-code alias source clauses []))

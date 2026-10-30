@@ -1,31 +1,46 @@
 # store
 
 An **adaptor-agnostic database storage library** for
-[Brood](https://github.com/broodlang/brood) — like Ecto, a bit better. Queries are plain data
-(no macro DSL, no pin operator), composed with ordinary functions and compiled
-to parameterized SQL; `schema`, `changeset`, and `repo` build on top. The actual
-database I/O is done by a swappable **adaptor** that implements a small contract,
-so the library depends on no specific driver — e.g.
+[Brood](https://github.com/broodlang/brood) — like Ecto, a bit better. A query is written
+with `query/from`, in Brood, and is plain data underneath: compiled to parameterized SQL,
+printable, and built on with ordinary functions; `schema`, `changeset`, and `repo` build on
+top. The actual database I/O is done by a swappable **adaptor** that implements a small
+contract, so the library depends on no specific driver — e.g.
 [`store-postgres`](https://github.com/broodlang/store-postgres).
 
 ## Usage
 
 ```brood fragment
-;; queries are data, composed with plain functions
-(-> (query/from :users)
-    (query/where [:ilike :name "%ada%"])
-    (query/order-by :inserted_at :desc)
-    (query/limit 10))
+;; `u.name` is a column of the table `u` names; every other symbol or call is a Brood value,
+;; bound as a parameter
+(query/from u :users
+  :where (ilike u.name (str "%" name "%"))
+  :order-by (desc u.inserted_at)
+  :limit 10)
 
 ;; a repo runs them over an adaptor (see store-postgres)
-(let (users (repo/all my-repo the-query))
+(let (users (repo/all my-repo the-query)
+      email (repo/value my-repo (query/from u :users :where (= u.id id) :select u.email)))
   (repo/insert my-repo :users {:name "Ada" :email "ada@example.com"}))
 ```
 
-Joins, aggregates, upserts and atomic increments are data too — no SQL strings:
+Joins, aggregates and subqueries read the same way:
 
 ```brood fragment
-(-> (query/from :organisations :o)
+(query/from o :organisations
+  :join m :members (= m.organisation_id o.id)
+  :group-by o.name
+  :select {:name o.name :members (count)})
+
+(query/from p :projects
+  :where (not (exists (from r :releases :where (= r.project_id p.id)))))
+```
+
+The builders make the same maps a step at a time, for a query put together in parts, and
+upserts and atomic increments are data too — no SQL strings:
+
+```brood fragment
+(-> (query/table :organisations :o)
     (query/select [:o.name [:as [:count] :members]])
     (query/join :members :m [:= :m.organisation_id [:col :o.id]])
     (query/group-by [:o.name]))
@@ -43,7 +58,7 @@ query a read does:
 (repo/fetch-by my-repo :users {:email email})          ; nil, the row, or an error if two match
 
 (repo/update-all my-repo
-  (-> (query/from :members :m)
+  (-> (query/table :members :m)
       (query/join :organisations :o [:= :o.id [:col :m.organisation_id]])
       (query/where {:o.name "acme"}))
   {:role "admin"})

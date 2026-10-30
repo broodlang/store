@@ -1,0 +1,101 @@
+;; query/from — a query written as Brood, compiled to the same SQL the builders make. Pure, no
+;; database needed.
+(defmodule from-test
+  (:use test)
+  (:alias query))
+
+(defn- sql (q) (query/to-sql q))
+
+(defn- pointer-of (change) (str "submitted/" change))
+
+(describe "query/from"
+  (test "a column, a bound value, a constant, an order and a limit"
+    (let (project-id 7 change "ab")
+      (assert= (sql (query/from o
+                      :mur_operations :where
+                      (and (= o.project_id project-id) (= o.pointer (pointer-of change)))
+                      :order-by o.id
+                      :select o.uploaded_by
+                      :limit 1))
+        [(str "SELECT \"o\".\"uploaded_by\" FROM \"mur_operations\" AS \"o\" WHERE "
+           "(\"o\".\"project_id\" = $1 AND \"o\".\"pointer\" = $2) ORDER BY \"o\".\"id\" ASC LIMIT $3")
+          [7 "submitted/ab" 1]])))
+
+  (test "a string written in the clause is in the SQL; one from a local is bound"
+    (let (prefix "env/%")
+      (assert= (sql (query/from p
+                      :mur_pointers :where
+                      (and (like p.name "change/%") (like p.name prefix))))
+        [(str "SELECT * FROM \"mur_pointers\" AS \"p\" WHERE "
+           "(\"p\".\"name\" LIKE 'change/%' AND \"p\".\"name\" LIKE $1)")
+          ["env/%"]])))
+
+  (test "a value on the left of = is turned round"
+    (let (id 3)
+      (assert= (first (sql (query/from u :users :where (= id u.id))))
+        "SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" = $1")))
+
+  (test "nil?, some?, not, or and not="
+    (assert= (first (sql (query/from u
+                           :users :where
+                           (or (nil? u.suspended_at) (not (some? u.confirmed_at)) (not= u.id 1)))))
+      (str "SELECT * FROM \"users\" AS \"u\" WHERE (\"u\".\"suspended_at\" IS NULL OR "
+        "NOT (\"u\".\"confirmed_at\" IS NOT NULL) OR \"u\".\"id\" <> 1)")))
+
+  (test "in over values is one bound array; in over a from is a subquery"
+    (let (ids [1 2 3])
+      (assert= (sql (query/from u :users :where (in u.id ids)))
+        ["SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" = ANY($1)" [[1 2 3]]])
+      (assert= (first (sql (query/from u
+                             :users :where
+                             (in u.id (from m :members :where (= m.role "admin") :select m.user_id)))))
+        (str "SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" IN "
+          "(SELECT \"m\".\"user_id\" FROM \"members\" AS \"m\" WHERE \"m\".\"role\" = 'admin')"))))
+
+  (test "a join, a map select naming each term, and a function of a column"
+    (let (name "hive")
+      (assert= (sql (query/from p
+                      :mur_projects :join
+                      o
+                      :mur_organisations (= o.id p.organisation_id)
+                      :where (= p.name name)
+                      :select {:id p.id :organisation (lower o.name)}))
+        [(str "SELECT \"p\".\"id\" AS \"id\", lower(\"o\".\"name\") AS \"organisation\" "
+           "FROM \"mur_projects\" AS \"p\" "
+           "JOIN \"mur_organisations\" AS \"o\" ON \"o\".\"id\" = \"p\".\"organisation_id\" "
+           "WHERE \"p\".\"name\" = $1")
+          ["hive"]])))
+
+  (test "a correlated subquery names the alias around it"
+    (assert= (first (sql (query/from p
+                           :mur_pointers :where
+                           (not (exists (from o
+                                          :mur_operations :where
+                                          (and (= o.project_id p.project_id)
+                                            (= o.new p.address)))))
+                           :select (count))))
+      (str "SELECT count(*) FROM \"mur_pointers\" AS \"p\" WHERE NOT (EXISTS (SELECT * FROM "
+        "\"mur_operations\" AS \"o\" WHERE (\"o\".\"project_id\" = \"p\".\"project_id\" AND "
+        "\"o\".\"new\" = \"p\".\"address\")))")))
+
+  (test "count over a Brood list is Brood's; a descending order and a grouping"
+    (let (names ["a" "b"])
+      (assert= (sql (query/from p
+                      :mur_pointers :where
+                      (= p.size (count names))
+                      :group-by p.project_id
+                      :select [p.project_id (max p.updated_at)]
+                      :order-by [(desc p.project_id)]))
+        [(str "SELECT \"p\".\"project_id\", max(\"p\".\"updated_at\") FROM \"mur_pointers\" AS \"p\" "
+           "WHERE \"p\".\"size\" = $1 GROUP BY \"p\".\"project_id\" ORDER BY \"p\".\"project_id\" DESC")
+          [2]])))
+
+  (test "the result is a query map the builders go on from"
+    (let (q (query/where (query/from u :users :select u.id) [:= :u.handle "ada"]))
+      (assert= (first (sql q))
+        "SELECT \"u\".\"id\" FROM \"users\" AS \"u\" WHERE \"u\".\"handle\" = $1")))
+
+  (test "an unknown clause is an error when it is expanded"
+    (assert (includes? (get (try (reflect/eval-string "(query/from u :users :wher 1)") (catch e e))
+                         :message)
+              ":wher is not a clause"))))

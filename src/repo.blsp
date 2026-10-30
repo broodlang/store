@@ -126,6 +126,23 @@
   "Run `q` with LIMIT 1; return the first row map, or nil if none."
   (first (all repo (query/limit (query/to-query q) 1))))
 
+(defn- only-column (row q)
+  "The one value of `row`, from a query selecting one column. A row is a map, whose keys are in
+  no order, so a query naming several has no first column to give."
+  (when (> (count row) 1)
+    (error "repo: value and column want a query selecting one column, not " (pr-str (keys row))
+      " — " (pr-str q)))
+  (first (vals row)))
+
+(defn value (repo q)
+  "The one column `q` selects, of its first row, or nil when there is none: `(repo/value repo
+  (from u :users :where (= u.id id) :select u.email))`."
+  (let (row (one repo q)) (if (nil? row) nil (only-column row q))))
+
+(defn column (repo q)
+  "The one column `q` selects, of every row, in order."
+  (into [] (map (all repo q) (fn (row) (only-column row q)))))
+
 (defn fetch-by (repo source condition)
   "The one row of `source` (a table, a schema or a query — its lock kept) matching
   `condition` — a map `{:email e}` or an expression — or nil. Over a query with a limit, a
@@ -159,9 +176,9 @@
   (let (q (query/to-query source))
     (cond
       (any? row-shaping-keys (fn (k) (contains? q k)))
-        (query/from (if (and (contains? q :group) (nil? (get q :select)))
-                      (query/select q (get q :group))
-                      q)
+        (query/table (if (and (contains? q :group) (nil? (get q :select)))
+                       (query/select q (get q :group))
+                       q)
           :store_rows)
       keep-lock? (dissoc q :order)
       :else (dissoc q :order :lock))))
@@ -340,7 +357,7 @@
         ids (seq/distinct (seq/filter (map rows (fn (r) (get r ref))) (fn (x) (not (nil? x)))))
         kids (if (empty? ids)
                []
-               (all repo (-> (query/from (get rel :table)) (query/where [:in fk ids]))))
+               (all repo (-> (query/table (get rel :table)) (query/where [:in fk ids]))))
         grouped (seq/group-by kids (fn (c) (get c fk))))
     (map rows
       (fn (r)
@@ -354,7 +371,7 @@
         ids (seq/distinct (seq/filter (map rows (fn (r) (get r fk))) (fn (x) (not (nil? x)))))
         parents (if (empty? ids)
                   []
-                  (all repo (-> (query/from (get rel :table)) (query/where [:in ref ids]))))
+                  (all repo (-> (query/table (get rel :table)) (query/where [:in ref ids]))))
         index (reduce parents {} (fn (m p) (assoc m (get p ref) p))))
     (map rows (fn (r) (assoc r akey (get index (get r fk)))))))
 
@@ -369,11 +386,11 @@
                               (fn (x) (not (nil? x)))))
         joins (if (empty? pkeys)
                 []
-                (all repo (-> (query/from (get rel :join-table)) (query/where [:in pfk pkeys]))))
+                (all repo (-> (query/table (get rel :join-table)) (query/where [:in pfk pkeys]))))
         tids (seq/distinct (seq/filter (map joins (fn (j) (get j tfk))) (fn (x) (not (nil? x)))))
         targets (if (empty? tids)
                   []
-                  (all repo (-> (query/from (get rel :table)) (query/where [:in tref tids]))))
+                  (all repo (-> (query/table (get rel :table)) (query/where [:in tref tids]))))
         tindex (reduce targets {} (fn (m t) (assoc m (get t tref) t)))
         joins-by-parent (seq/group-by joins (fn (j) (get j pfk))))
     (map rows
