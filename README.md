@@ -28,7 +28,7 @@ Joins, aggregates and subqueries read the same way:
 
 ```brood fragment
 (query/from o :organisations
-  :join m :members (= m.organisation_id o.id)
+  :join [m :members (= m.organisation_id o.id)]
   :group-by o.name
   :select {:name o.name :members (count)})
 

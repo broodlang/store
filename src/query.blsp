@@ -1165,7 +1165,7 @@
 ;;
 ;; `(from o :mur_operations :where (= o.pointer pointer) :select o.uploaded_by)` is the query
 ;; the builders above make, written the way the rest of the program is. The first symbol names
-;; the table, and every `o.column` in the clauses is that column; `:join p :t on` names
+;; the table, and every `o.column` in the clauses is that column; `:join [p :t on]` names
 ;; another. In a clause a form is SQL when its head is one of the operators below (`=` `and`
 ;; `like` `nil?` `in` …) or a function of a column (`count` `max` `lower` …); anything else —
 ;; a local, `(get user :id)`, `(str "env/" name)` — is a Brood value, worked out as the query is
@@ -1233,8 +1233,8 @@
    :limit 1
    :offset 1
    :distinct 1
-   :join 3
-   :left-join 3
+   :join 1
+   :left-join 1
    :union 1
    :union-all 1})
 
@@ -1340,6 +1340,13 @@
         (clause-pairs (drop clauses (+ 1 wanted))
           (conj so-far [key (into [] (take (rest clauses) wanted))]))))))
 
+(defn- join-form (form)
+  "A join clause's form, `[alias source on]`, checked."
+  (when (not (and (vector? form) (= (count form) 3) (symbol? (first form))))
+    (error "from: a join is [alias source on] — :join [o :organisations (= o.id p.organisation_id)], not "
+      (pr-str form)))
+  form)
+
 (defn- clause-steps (key forms aliases)
   (let (form (first forms))
     (match key
@@ -1351,10 +1358,10 @@
       (:limit [`(limit ~form)])
       (:offset [`(offset ~form)])
       (:distinct (if form [`(distinct)] []))
-      (:join [`(join ~(nth forms 1)
-                 ~(keyword (->string (nth forms 0))) ~(clause-code (nth forms 2) aliases))])
-      (:left-join [`(left-join ~(nth forms 1)
-                      ~(keyword (->string (nth forms 0))) ~(clause-code (nth forms 2) aliases))])
+      (:join [`(join ~(nth (join-form form) 1)
+                 ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
+      (:left-join [`(left-join ~(nth (join-form form) 1)
+                      ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
       (:union [`(union ~(clause-code form aliases))])
       (:union-all [`(union-all ~(clause-code form aliases))]))))
 
@@ -1366,7 +1373,7 @@
       (pr-str alias)))
   (let (pairs (clause-pairs clauses)
         joined (map (seq/filter pairs (fn (pair) (includes? [:join :left-join] (first pair))))
-                 (fn (pair) (->string (first (second pair)))))
+                 (fn (pair) (->string (first (join-form (first (second pair)))))))
         aliases (into (into [(->string alias)] joined) outer)
         steps (apply append
                 (map pairs (fn (pair) (clause-steps (first pair) (second pair) aliases)))))
@@ -1375,7 +1382,7 @@
 (defmacro from (alias source & clauses)
   "A query, written as Brood: `alias` (a symbol) names `source` (a table keyword, or a schema),
   and the clauses — `:where`, `:select`, `:order-by`, `:group-by`, `:having`, `:limit`,
-  `:offset`, `:distinct`, `:join alias source on`, `:left-join …`, `:union`, `:union-all` —
+  `:offset`, `:distinct`, `:join [alias source on]`, `:left-join […]`, `:union`, `:union-all` —
   say the rest. In them `alias.column` is a column, an operator (`=` `not=` `<` `and` `or`
   `not` `like` `nil?` `some?` `in` `exists` `between` …) or a function of a column (`count`
   `max` `lower` `coalesce` `cast` …) is SQL, a string or number written there is a constant in

@@ -1,14 +1,17 @@
 ;; store — a database storage library for Brood ("like Ecto, a bit better").
 ;;
-;; Adaptor-agnostic: queries are plain data (no macro DSL, no pin operator),
-;; composed with ordinary functions and compiled to parameterized SQL; schema,
-;; changeset, and the repo build on that. The actual database I/O is done by a
-;; swappable *adaptor* (e.g. `store-postgres`) that implements a small contract,
-;; so the library has no dependency on any specific database driver.
+;; Adaptor-agnostic: a query is written with `query/from`, in Brood, and is plain data
+;; underneath, compiled to parameterized SQL; schema, changeset, and the repo build on that.
+;; The actual database I/O is done by a swappable *adaptor* (e.g. `store-postgres`) that
+;; implements a small contract, so the library has no dependency on any specific database
+;; driver.
 (project
   :name "store"
   :version "0.8.0"
   :brood ">= 0.47.0"
   :description
     "An adaptor-agnostic database storage library for Brood (Ecto-like): queries as plain data, schema, changeset, and a repo over a swappable driver."
-  :repository "https://github.com/broodlang/store")
+  :repository "https://github.com/broodlang/store"
+  ;; How `nest format` lays out `from` in a project that lists store in `:format-plugins`: the
+  ;; alias and the table on the head line, then each clause and its form, one pair a line.
+  :format-headers {from 2 query/from 2})

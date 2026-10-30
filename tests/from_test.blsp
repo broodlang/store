@@ -11,9 +11,8 @@
 (describe "query/from"
   (test "a column, a bound value, a constant, an order and a limit"
     (let (project-id 7 change "ab")
-      (assert= (sql (query/from o
-                      :mur_operations :where
-                      (and (= o.project_id project-id) (= o.pointer (pointer-of change)))
+      (assert= (sql (query/from o :mur_operations
+                      :where (and (= o.project_id project-id) (= o.pointer (pointer-of change)))
                       :order-by o.id
                       :select o.uploaded_by
                       :limit 1))
@@ -23,9 +22,8 @@
 
   (test "a string written in the clause is in the SQL; one from a local is bound"
     (let (prefix "env/%")
-      (assert= (sql (query/from p
-                      :mur_pointers :where
-                      (and (like p.name "change/%") (like p.name prefix))))
+      (assert= (sql (query/from p :mur_pointers
+                      :where (and (like p.name "change/%") (like p.name prefix))))
         [(str "SELECT * FROM \"mur_pointers\" AS \"p\" WHERE "
            "(\"p\".\"name\" LIKE 'change/%' AND \"p\".\"name\" LIKE $1)")
           ["env/%"]])))
@@ -36,9 +34,8 @@
         "SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" = $1")))
 
   (test "nil?, some?, not, or and not="
-    (assert= (first (sql (query/from u
-                           :users :where
-                           (or (nil? u.suspended_at) (not (some? u.confirmed_at)) (not= u.id 1)))))
+    (assert= (first (sql (query/from u :users
+                           :where (or (nil? u.suspended_at) (not (some? u.confirmed_at)) (not= u.id 1)))))
       (str "SELECT * FROM \"users\" AS \"u\" WHERE (\"u\".\"suspended_at\" IS NULL OR "
         "NOT (\"u\".\"confirmed_at\" IS NOT NULL) OR \"u\".\"id\" <> 1)")))
 
@@ -46,18 +43,15 @@
     (let (ids [1 2 3])
       (assert= (sql (query/from u :users :where (in u.id ids)))
         ["SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" = ANY($1)" [[1 2 3]]])
-      (assert= (first (sql (query/from u
-                             :users :where
-                             (in u.id (from m :members :where (= m.role "admin") :select m.user_id)))))
+      (assert= (first (sql (query/from u :users
+                             :where (in u.id (from m :members :where (= m.role "admin") :select m.user_id)))))
         (str "SELECT * FROM \"users\" AS \"u\" WHERE \"u\".\"id\" IN "
           "(SELECT \"m\".\"user_id\" FROM \"members\" AS \"m\" WHERE \"m\".\"role\" = 'admin')"))))
 
   (test "a join, a map select naming each term, and a function of a column"
     (let (name "hive")
-      (assert= (sql (query/from p
-                      :mur_projects :join
-                      o
-                      :mur_organisations (= o.id p.organisation_id)
+      (assert= (sql (query/from p :mur_projects
+                      :join [o :mur_organisations (= o.id p.organisation_id)]
                       :where (= p.name name)
                       :select {:id p.id :organisation (lower o.name)}))
         [(str "SELECT \"p\".\"id\" AS \"id\", lower(\"o\".\"name\") AS \"organisation\" "
@@ -67,11 +61,9 @@
           ["hive"]])))
 
   (test "a correlated subquery names the alias around it"
-    (assert= (first (sql (query/from p
-                           :mur_pointers :where
-                           (not (exists (from o
-                                          :mur_operations :where
-                                          (and (= o.project_id p.project_id)
+    (assert= (first (sql (query/from p :mur_pointers
+                           :where (not (exists (from o :mur_operations
+                                          :where (and (= o.project_id p.project_id)
                                             (= o.new p.address)))))
                            :select (count))))
       (str "SELECT count(*) FROM \"mur_pointers\" AS \"p\" WHERE NOT (EXISTS (SELECT * FROM "
@@ -80,9 +72,8 @@
 
   (test "count over a Brood list is Brood's; a descending order and a grouping"
     (let (names ["a" "b"])
-      (assert= (sql (query/from p
-                      :mur_pointers :where
-                      (= p.size (count names))
+      (assert= (sql (query/from p :mur_pointers
+                      :where (= p.size (count names))
                       :group-by p.project_id
                       :select [p.project_id (max p.updated_at)]
                       :order-by [(desc p.project_id)]))
@@ -96,16 +87,14 @@
         "SELECT \"u\".\"id\" FROM \"users\" AS \"u\" WHERE \"u\".\"handle\" = $1")))
 
   (test "a function of (count) is SQL, and a constant is selected as one"
-    (assert= (first (sql (query/from p
-                           :mur_pointers :select
-                           {:kind "open" :value (cast (count) :text)})))
+    (assert= (first (sql (query/from p :mur_pointers
+                           :select {:kind "open" :value (cast (count) :text)})))
       "SELECT 'open' AS \"kind\", CAST(count(*) AS text) AS \"value\" FROM \"mur_pointers\" AS \"p\""))
 
   (test "union-all, more than once"
     (let (id 7)
-      (assert= (sql (query/from t
-                      :p :where
-                      (= t.id id)
+      (assert= (sql (query/from t :p
+                      :where (= t.id id)
                       :select t.name
                       :union-all (from u :q :select u.name)
                       :union-all (from v :r :select v.name)))
