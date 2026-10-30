@@ -95,6 +95,24 @@
       (assert= (first (sql q))
         "SELECT \"u\".\"id\" FROM \"users\" AS \"u\" WHERE \"u\".\"handle\" = $1")))
 
+  (test "a function of (count) is SQL, and a constant is selected as one"
+    (assert= (first (sql (query/from p
+                           :mur_pointers :select
+                           {:kind "open" :value (cast (count) :text)})))
+      "SELECT 'open' AS \"kind\", CAST(count(*) AS text) AS \"value\" FROM \"mur_pointers\" AS \"p\""))
+
+  (test "union-all, more than once"
+    (let (id 7)
+      (assert= (sql (query/from t
+                      :p :where
+                      (= t.id id)
+                      :select t.name
+                      :union-all (from u :q :select u.name)
+                      :union-all (from v :r :select v.name)))
+        [(str "SELECT \"t\".\"name\" FROM \"p\" AS \"t\" WHERE \"t\".\"id\" = $1 UNION ALL ("
+           "SELECT \"u\".\"name\" FROM \"q\" AS \"u\") UNION ALL (SELECT \"v\".\"name\" FROM \"r\" AS \"v\")")
+          [7]])))
+
   (test "an unknown clause is an error when it is expanded"
     (assert (includes? (get (try (reflect/eval-string "(query/from u :users :wher 1)") (catch e e))
                          :message)

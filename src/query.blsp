@@ -1247,8 +1247,11 @@
       (when (and (> dot 0) (includes? aliases (string/substring text 0 dot))) (keyword text)))))
 
 (defn- names-column? (form aliases)
+  "Whether `form` is SQL through and through: it names a column of `aliases`, or holds a
+  `(count)`, the count of rows, which is nothing in Brood."
   (cond
     (not (nil? (column-of form aliases))) true
+    (and (list? form) (= (count form) 1) (= (first form) (quote count))) true
     (or (list? form) (vector? form)) (any? form (fn (part) (names-column? part aliases)))
     :else false))
 
@@ -1278,7 +1281,7 @@
           (cond
             (not (nil? operator)) (predicate-code operator arguments aliases)
             (and (contains? *function-operators* head)
-              (or (names-column? form aliases) (and (= head 'count) (empty? arguments))))
+              (names-column? form aliases))
               (into [(get *function-operators* head)]
                 (map arguments (fn (argument) (clause-code argument aliases))))
             :else form))
