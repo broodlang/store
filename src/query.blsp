@@ -1236,7 +1236,8 @@
    :join 1
    :left-join 1
    :union 1
-   :union-all 1})
+   :union-all 1
+   :lock 1})
 
 (defn- column-of (form aliases)
   "The column `form` names, as a keyword, when it is a symbol `alias.column` for one of
@@ -1274,6 +1275,9 @@
       (not (nil? column)) [:col column]
       (written-constant? form) [:literal form]
       (from-form? form) (from-code (nth form 1) (nth form 2) (drop form 3) aliases)
+      ;; a condition only some calls have (`conditional-code`)
+      (and (list? form) (includes? [(quote when) (quote if)] (first form)))
+        (conditional-code form aliases)
       (and (list? form) (not (empty? form)) (symbol? (first form)))
         (let (head (first form)
               arguments (into [] (rest form))
@@ -1286,6 +1290,14 @@
                 (map arguments (fn (argument) (clause-code argument aliases))))
             :else form))
       :else form)))
+
+(defn- conditional-code (form aliases)
+  "`(when test condition)` or `(if test condition other)` in a clause: the test is Brood, run as
+  the query is made, and the conditions SQL. One left out is nil, which the `and` or `or`
+  around it leaves out (`junction`)."
+  (if (= (first form) (quote when))
+    `(when ~(nth form 1) ~(clause-code (nth form 2) aliases))
+    `(if ~(nth form 1) ~(clause-code (nth form 2) aliases) ~(clause-code (nth form 3 nil) aliases))))
 
 (defn- predicate-code (operator arguments aliases)
   (let (operands (into [] (map arguments (fn (argument) (clause-code argument aliases)))))
@@ -1306,13 +1318,16 @@
         (if (from-form? (second arguments))
           [:not-in (first operands) (second operands)]
           [:not [:any (first operands) (second operands)]])
+      ;; one left out (`when`, or a Brood value that is nil) is no condition, not a false one
+      (includes? [:and :or] operator) `(junction ~operator ~operands)
       :else (into [operator] operands))))
 
 (defn- select-code (form aliases)
   (cond
     (map? form) (into {} (map (keys form) (fn (key) [key (clause-code (get form key) aliases)])))
     (vector? form) (into [] (map form (fn (part) (clause-code part aliases))))
-    :else [(clause-code form aliases)]))
+    ;; a column or an expression is one term; any other form is Brood's, a list of terms
+    :else (let (code (clause-code form aliases)) (if (= code form) form [code]))))
 
 (defn- order-steps (form aliases)
   "One `order-by` step for each term of `form`: a column or expression, or `(desc …)` /
@@ -1363,7 +1378,8 @@
       (:left-join [`(left-join ~(nth (join-form form) 1)
                       ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
       (:union [`(union ~(clause-code form aliases))])
-      (:union-all [`(union-all ~(clause-code form aliases))]))))
+      (:union-all [`(union-all ~(clause-code form aliases))])
+      (:lock (if (vector? form) [`(lock ~@form)] [`(lock ~form)])))))
 
 (defn- from-code (alias source clauses outer)
   "The code `(from alias source & clauses)` expands to, inside a query whose aliases are
@@ -1382,7 +1398,7 @@
 (defmacro from (alias source & clauses)
   "A query, written as Brood: `alias` (a symbol) names `source` (a table keyword, or a schema),
   and the clauses — `:where`, `:select`, `:order-by`, `:group-by`, `:having`, `:limit`,
-  `:offset`, `:distinct`, `:join [alias source on]`, `:left-join […]`, `:union`, `:union-all` —
+  `:offset`, `:distinct`, `:join [alias source on]`, `:left-join […]`, `:union`, `:union-all`, `:lock` —
   say the rest. In them `alias.column` is a column, an operator (`=` `not=` `<` `and` `or`
   `not` `like` `nil?` `some?` `in` `exists` `between` …) or a function of a column (`count`
   `max` `lower` `coalesce` `cast` …) is SQL, a string or number written there is a constant in
@@ -1397,3 +1413,12 @@
 
   The result is a query map, the same the builders make (`table`, `where` …)."
   (from-code alias source clauses []))
+
+(defn junction (operator operands)
+  "The `and` or `or` of `operands` that `from` writes, leaving out any that is nil (a condition
+  a `when` left out): nil when none is left, the one when one is."
+  (let (kept (into [] (seq/filter operands (fn (operand) (not (nil? operand))))))
+    (cond
+      (empty? kept) nil
+      (= (count kept) 1) (first kept)
+      :else (into [operator] kept))))

@@ -102,6 +102,36 @@
            "SELECT \"u\".\"name\" FROM \"q\" AS \"u\") UNION ALL (SELECT \"v\".\"name\" FROM \"r\" AS \"v\")")
           [7]])))
 
+  (test "a when in an and is a condition only when its test holds"
+    (let (shown (fn (before)
+                  (sql (query/from o :ops
+                         :where (and (= o.project_id 7) (when before (< o.id before)))
+                         :select o.id))))
+      (assert= (shown 40)
+        ["SELECT \"o\".\"id\" FROM \"ops\" AS \"o\" WHERE (\"o\".\"project_id\" = 7 AND \"o\".\"id\" < $1)"
+          [40]])
+      (assert= (shown nil)
+        ["SELECT \"o\".\"id\" FROM \"ops\" AS \"o\" WHERE \"o\".\"project_id\" = 7" []])))
+
+  (test "an if picks the condition; a condition the caller made is taken as it is"
+    (let (given [:= :o.kind "a"]
+          q (fn (recent?)
+              (query/from o :ops :where (and (if recent? (> o.id 9) (<= o.id 9)) given))))
+      (assert= (first (sql (q true)))
+        "SELECT * FROM \"ops\" AS \"o\" WHERE (\"o\".\"id\" > 9 AND \"o\".\"kind\" = $1)")
+      (assert= (first (sql (q false)))
+        "SELECT * FROM \"ops\" AS \"o\" WHERE (\"o\".\"id\" <= 9 AND \"o\".\"kind\" = $1)")))
+
+  (test "a select from a Brood value is that list of terms, and a lock"
+    (let (columns [:id :name])
+      (assert= (first (sql (query/from r :runners
+                             :where (= r.id 1)
+                             :select columns
+                             :lock [:update :skip-locked])))
+        "SELECT \"id\", \"name\" FROM \"runners\" AS \"r\" WHERE \"r\".\"id\" = 1 FOR UPDATE SKIP LOCKED")
+      (assert= (first (sql (query/from r :runners :lock :share)))
+        "SELECT * FROM \"runners\" AS \"r\" FOR SHARE")))
+
   (test "an unknown clause is an error when it is expanded"
     (assert (includes? (get (try (reflect/eval-string "(query/from u :users :wher 1)") (catch e e))
                          :message)
