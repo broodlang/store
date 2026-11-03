@@ -68,8 +68,8 @@
                   (cond
                     (map? spec) (get spec :type)
                     (vector? spec) (first spec)
-                    :else spec))))))
-    :else types-or-schema))
+                    else spec))))))
+    else types-or-schema))
 
 (defn- blank? (v)
   (and (string? v) (= (string/trim v) "")))
@@ -89,13 +89,13 @@
       (cond
         (int? v) [:ok v]
         (string? v) (let (n (parse-number v)) (if (int? n) [:ok n] :error))
-        :else :error)
+        else :error)
     (or (= type :float) (= type :real))
       (cond
         (int? v) [:ok (* 1.0 v)]
         (float? v) [:ok v]
         (string? v) (let (n (parse-number v)) (if (nil? n) :error [:ok (* 1.0 n)]))
-        :else :error)
+        else :error)
     (or (= type :numeric) (= type :decimal))
       (cond
         (decimal? v) [:ok v]
@@ -103,16 +103,16 @@
         (string? v)
           (check-allow :discarded-catch
             (try [:ok (decimal/of (string/trim v))] (catch _ :error)))
-        :else :error)
+        else :error)
     (or (= type :boolean) (= type :bool))
       (cond
         (bool? v) [:ok v]
         (not (string? v)) :error
         (includes? ["true" "1" "on" "yes"] (string/lower v)) [:ok true]
         (includes? ["false" "0" "off" "no"] (string/lower v)) [:ok false]
-        :else :error)
+        else :error)
     (or (= type :text) (= type :string)) (if (string? v) [:ok v] :error)
-    :else [:ok v]))
+    else [:ok v]))
 
 ;; ---- building ------------------------------------------------------------------
 
@@ -122,7 +122,7 @@
   (cond
     (contains? params field) [:present (get params field)]
     (contains? params (->string field)) [:present (get params (->string field))]
-    :else [:absent]))
+    else [:absent]))
 
 (defn put-change (cs field value)
   "Set `field` to `value` programmatically — a derived or defaulted field. Equal to the
@@ -218,7 +218,7 @@
   (cond
     (contains? (get cs :changes) field) (get (get cs :changes) field)
     (contains? (get cs :data) field) (get (get cs :data) field)
-    :else default))
+    else default))
 
 (defn apply-changes (cs)
   "The resulting record: the data with the changes applied."
@@ -293,7 +293,7 @@
           (and (contains? opts :max) (> n (get opts :max)))
             [(get opts :message (str "should be at most %{count} " unit))
               {:validation :length :kind :max :count (get opts :max)}]
-          :else nil)))))
+          else nil)))))
 
 (def- number-checks
   [[:less-than < "must be less than %{number}"]
@@ -380,7 +380,7 @@
           (nil? outcome) nil
           (string? outcome) [outcome {:validation :custom}]
           (empty? outcome) nil
-          :else [(first outcome) {:validation :custom}])))))
+          else [(first outcome) {:validation :custom}])))))
 
 (defn validate (cs field pred message)
   "If `field` has a change and `(pred value)` is false, add `message`."

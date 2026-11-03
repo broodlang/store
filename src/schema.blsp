@@ -55,7 +55,7 @@
   (cond
     (map? spec) spec
     (vector? spec) (assoc (or (second spec) {}) :type (first spec))
-    :else {:type spec}))
+    else {:type spec}))
 
 (defn fields (s)
   "`s`'s fields, each in its long form (`field-spec`)."
@@ -76,7 +76,7 @@
     (decimal? v) (decimal/->string v)
     (string? v) (str "'" (string/replace v "'" "''") "'")
     (and (vector? v) (= (first v) :raw)) (second v)
-    :else (error "schema: no SQL literal for " (pr-str v))))
+    else (error "schema: no SQL literal for " (pr-str v))))
 
 (defn- inline-params (sql params index)
   "Replace `$index`…`$1` with their literals, highest first (so `$1` never eats `$10`)."
@@ -129,7 +129,7 @@
   (cond
     (nil? pk) []
     (vector? pk) pk
-    :else [pk]))
+    else [pk]))
 
 (defn create-table-sql (s &optional (opts {}))
   "`CREATE TABLE` from a schema map. `opts`: `:if-not-exists`."

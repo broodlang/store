@@ -63,7 +63,7 @@
   (cond
     (empty? ws) nil
     (includes? shape-qualifiers (string/upper (first ws))) (shape-name (rest ws))
-    :else
+    else
       (let (name (string/replace (first (string/split (first (string/split (first ws) "(")) ";"))
                    "\"" ""))
         (if (= name "") nil name))))
@@ -80,7 +80,7 @@
                                   (empty? ws) nil
                                   (includes? shape-keywords (string/upper (first ws)))
                                     (shape-name (rest ws))
-                                  :else (after (rest ws)))))
+                                  else (after (rest ws)))))
                  (after words)))
     {:op op :source source}))
 
@@ -181,7 +181,7 @@
                        q)
           :store_rows)
       keep-lock? (dissoc q :order)
-      :else (dissoc q :order :lock))))
+      else (dissoc q :order :lock))))
 
 (defn aggregate (repo q op &optional column)
   "One aggregate over the rows `q` selects: `(aggregate repo q :sum :bytes)`. `op` is

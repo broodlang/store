@@ -293,11 +293,11 @@
                     nulled (cond
                              (not (contains? changes :null)) typed
                              (get changes :null) (dissoc typed :null)
-                             :else (assoc typed :null false))
+                             else (assoc typed :null false))
                     defaulted (cond
                                 (not (contains? changes :default)) nulled
                                 (nil? (get changes :default)) (dissoc nulled :default)
-                                :else (assoc nulled :default (get changes :default))))
+                                else (assoc nulled :default (get changes :default))))
                 (assoc t :fields (assoc (get t :fields) field defaulted))))))
       :create-index
         (let (table (nth args 0 nil)
@@ -432,7 +432,7 @@
               (cons [:create-table table (definition-of (get want table))]
                 (map (vals (get (get want table) :indexes)) (fn (idx) [:create-index table idx])))
             (not (contains? want table)) [[:drop-table table (definition-of (get have table))]]
-            :else (table-steps table (get have table) (get want table))))))))
+            else (table-steps table (get have table) (get want table))))))))
 
 (defn check (migrations schemas)
   "The steps by which `migrations` fall short of `schemas` — empty when they agree.
@@ -630,7 +630,7 @@
     (cond
       (empty? tail) nil
       (int? value) value
-      :else (error "--" name " needs a whole number"))))
+      else (error "--" name " needs a whole number"))))
 
 (defn- with-repo (adaptor opts f)
   (let (r (repo/open adaptor (assoc opts :size 1)))
@@ -707,7 +707,7 @@
               options (cond
                         target {:log say :to target}
                         steps {:log say :step steps}
-                        :else {:log say}))
+                        else {:log say}))
           (with-repo adaptor
             opts
             (fn (r)

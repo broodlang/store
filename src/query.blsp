@@ -105,7 +105,7 @@
     (query? source) source
     (schema? source) {:from (get source :table)}
     (or (keyword? source) (string? source)) {:from source}
-    :else (error "query: not a query, a table or a schema: " (pr-str source))))
+    else (error "query: not a query, a table or a schema: " (pr-str source))))
 
 (defn- check-keys (q allowed context)
   (let (unknown (seq/filter (keys q) (fn (k) (not (contains? allowed k)))))
@@ -142,7 +142,7 @@
   (cond
     (nil? columns) []
     (map? columns) (into [] (map (sorted-keys columns) (fn (k) [:as (get columns k) k])))
-    :else (into [] columns)))
+    else (into [] columns)))
 
 (defn select-merge (q columns)
   "Add `columns` to what `q` already selects — every column (`*`) when it selected none.
@@ -153,7 +153,7 @@
         (cond
           (and (map? previous) (map? columns)) (merge previous columns)
           (nil? previous) (into [:*] (select-terms columns))
-          :else (into (select-terms previous) (select-terms columns))))))
+          else (into (select-terms previous) (select-terms columns))))))
 
 (defn distinct (q)
   "SELECT DISTINCT — collapse duplicate rows."
@@ -235,7 +235,7 @@
   (cond
     (nil? a) b
     (nil? b) a
-    :else [:and a b]))
+    else [:and a b]))
 
 (defn where (q condition)
   "Add a condition — an expression, or a map of columns to the values they equal —
@@ -383,23 +383,23 @@
                             (contains? word-characters c) (walk more :words)
                             (= c "(") (walk more :precision)
                             (= c "[") (walk more :array-open)
-                            :else false)
+                            else false)
                         :precision
                           (cond
                             (contains? precision-characters c) (walk more :precision)
                             (= c ")") (walk more :after-precision)
-                            :else false)
+                            else false)
                         :after-precision
                           (cond
                             (contains? word-characters c) (walk more :after-precision)
                             (= c "[") (walk more :array-open)
-                            :else false)
+                            else false)
                         :array-open
                           (cond
                             (= c "]") (walk more :array-closed)
                             (contains? (into #{} (string/->list "0123456789")) c)
                               (walk more :array-open)
-                            :else false)
+                            else false)
                         :array-closed (if (= c "[") (walk more :array-open) false)
                         false)))))
     (let (characters (string/->list name))
@@ -490,7 +490,7 @@
     (= value false) "FALSE"
     (int? value) (str value)
     (string? value) (str "'" (string/replace value "'" "''") "'")
-    :else (error "query: a :literal is a string, an integer, a boolean or nil, not " (pr-str value))))
+    else (error "query: a :literal is a string, an integer, a boolean or nil, not " (pr-str value))))
 
 (defn- bind (value params)
   [(placeholder params) (conj params value)])
@@ -518,7 +518,7 @@
   (cond
     (expression? x) (compile-nested x params)
     (query? x) (compile-subquery x params)
-    :else (bind x params)))
+    else (bind x params)))
 
 (defn compile-operand (x params)
   "A left-hand operand: a keyword is a column, an expression compiles (parenthesised when
@@ -527,7 +527,7 @@
     (keyword? x) [(ident x) params]
     (expression? x) (compile-nested x params)
     (query? x) (compile-subquery x params)
-    :else (bind x params)))
+    else (bind x params)))
 
 (defn- compile-list (xs params compile-one)
   "Compile each of `xs` with `compile-one`, threading params; `[sqls params']`."
@@ -589,7 +589,7 @@
     ;; nothing is in an empty list — and the column is not compiled, so a value it would
     ;; have bound does not leave a parameter the statement never mentions
     (empty? values) [(if negated? "TRUE" "FALSE") params]
-    :else
+    else
       (let (_ (map values
                 (fn (value) (check-operand [(if negated? :not-in :in) column values] value false)))
             [column-sql after-column] (compile-operand column params)
@@ -618,7 +618,7 @@
                         (when (not (empty? (rest (rest remaining))))
                           (error "query: :else ends a [:case]"))
                         [(str sql " ELSE " value-sql " END") next])
-                    :else
+                    else
                       (let ([test-sql after-test] (compile-expr (first remaining) current)
                             [value-sql after-value] (compile-operand (second remaining)
                                                       after-test))
@@ -634,7 +634,7 @@
   (cond
     (and (vector? term) (= (count term) 2) (contains? directions (second term))) term
     (and (vector? term) (not (expression? term))) (do (check-direction (second term)) term)
-    :else [term :asc]))
+    else [term :asc]))
 
 (defn- compile-order-terms (terms params)
   (let ([sqls next] (compile-list terms
@@ -681,7 +681,7 @@
                       (empty? arguments)
                         (error "query: a :fragment has more ? holes than arguments: "
                           (pr-str template))
-                      :else
+                      else
                         (let ([argument-sql next] (compile-operand (first arguments) current))
                           (walk (rest remaining)
                             (rest arguments)
@@ -713,7 +713,7 @@
       (cond
         (query? expr) (error "query: a query is not a condition — [:exists q] or [:in col q]")
         (empty? expr) ["TRUE" params]
-        :else (compile-expr (equalities expr) params))
+        else (compile-expr (equalities expr) params))
       (let (op (first expr)
             args (rest expr))
         (cond
@@ -794,7 +794,7 @@
           (= op :literal) [(literal-sql (first args)) params]
           (= op :fragment) (compile-fragment (first args) (rest args) params)
           (= op :raw) [(first args) params]
-          :else (error "query: unknown operator " (pr-str op)))))))
+          else (error "query: unknown operator " (pr-str op)))))))
 
 ;; ---- SELECT assembly ---------------------------------------------------------
 
@@ -819,7 +819,7 @@
         (let ([sqls next] (compile-list on params compile-operand))
           [(str "DISTINCT ON (" (string/join sqls ", ") ") ") next])
       (get q :distinct) ["DISTINCT " params]
-      :else ["" params])))
+      else ["" params])))
 
 (defn- compile-joins (joins params)
   (compile-list (or joins [])
@@ -831,7 +831,7 @@
                             (= kind "CROSS JOIN") ["" after-source]
                             ;; a lateral join is usually ON TRUE — the subquery did the matching
                             (nil? (get j :on)) [" ON TRUE" after-source]
-                            :else
+                            else
                               (let ([sql after] (compile-expr (get j :on) after-source))
                                 [(str " ON " sql) after])))
         [(str " " kind " " source on-sql) next]))))
@@ -947,7 +947,7 @@
     (cond
       (= returning :all) [(str " RETURNING " star) params]
       (= returning :none) ["" params]
-      :else
+      else
         (let ([sqls next] (compile-list (select-terms returning) params compile-operand))
           [(str " RETURNING " (string/join sqls ", ")) next]))))
 
@@ -973,7 +973,7 @@
                      (str " ON CONSTRAINT " (ident (get conflict :constraint)))
                    (get conflict :target)
                      (str " (" (string/join (map (get conflict :target) ident) ", ") ")")
-                   :else "")
+                   else "")
           action (get conflict :do :nothing))
       (check-keys conflict #{:target :constraint :do :where} "an :on-conflict")
       (cond
@@ -995,7 +995,7 @@
           (let ([sqls after-set] (compile-assignments action params)
                 [where-sql next] (compile-clause " WHERE " (get conflict :where) after-set))
             [(str " ON CONFLICT" target " DO UPDATE SET " (string/join sqls ", ") where-sql) next])
-        :else (error "query: bad :on-conflict :do " (pr-str action))))))
+        else (error "query: bad :on-conflict :do " (pr-str action))))))
 
 (defn- insert-select-sql (table q opts)
   (let (selected (get q :select))
@@ -1054,7 +1054,7 @@
     (nil? condition) true
     (map? condition) (and (not (query? condition)) (empty? condition))
     (and (vector? condition) (= (first condition) :and)) (every? (rest condition) every-row?)
-    :else false))
+    else false))
 
 (defn- check-condition (condition context)
   "A write's condition must name something: nil, `{}` or an `[:and]` of nothing — a filter
@@ -1254,7 +1254,7 @@
     (not (nil? (column-of form aliases))) true
     (and (list? form) (= (count form) 1) (= (first form) (quote count))) true
     (or (list? form) (vector? form)) (any? form (fn (part) (names-column? part aliases)))
-    :else false))
+    else false))
 
 (defn- written-constant? (form)
   (or (string? form) (int? form) (= form true) (= form false)))
@@ -1288,8 +1288,8 @@
               (names-column? form aliases))
               (into [(get *function-operators* head)]
                 (map arguments (fn (argument) (clause-code argument aliases))))
-            :else form))
-      :else form)))
+            else form))
+      else form)))
 
 (defn- conditional-code (form aliases)
   "`(when test condition)` or `(if test condition other)` in a clause: the test is Brood, run as
@@ -1317,14 +1317,14 @@
           `(membership ~operator ~(first operands) ~(second operands)))
       ;; one left out (`when`, or a Brood value that is nil) is no condition, not a false one
       (includes? [:and :or] operator) `(junction ~operator ~operands)
-      :else (into [operator] operands))))
+      else (into [operator] operands))))
 
 (defn- select-code (form aliases)
   (cond
     (map? form) (into {} (map (keys form) (fn (key) [key (clause-code (get form key) aliases)])))
     (vector? form) (into [] (map form (fn (part) (clause-code part aliases))))
     ;; a column or an expression is one term; any other form is Brood's, a list of terms
-    :else (let (code (clause-code form aliases)) (if (= code form) form [code]))))
+    else (let (code (clause-code form aliases)) (if (= code form) form [code]))))
 
 (defn- order-steps (form aliases)
   "One `order-by` step for each term of `form`: a column or expression, or `(desc …)` /
@@ -1418,7 +1418,7 @@
     (cond
       (empty? kept) nil
       (= (count kept) 1) (first kept)
-      :else (into [operator] kept))))
+      else (into [operator] kept))))
 
 (defn membership (operator column values)
   "`from`'s `(in column values)` (or `not-in`): IN a subquery when `values` is a query, else
@@ -1426,4 +1426,4 @@
   (cond
     (query? values) [operator column values]
     (= operator :in) [:any column values]
-    :else [:not [:any column values]]))
+    else [:not [:any column values]]))
