@@ -116,7 +116,7 @@
             "ALTER TABLE \"users\" ADD COLUMN \"handle\" text" "UPDATE users SET handle = email"
             "ALTER TABLE \"users\" ALTER COLUMN \"handle\" SET NOT NULL"))))
   (test "version-now is a 14-digit timestamp"
-    (is (= (string/length (str (migration/version-now))) 14))))
+    (is (= (count (str (migration/version-now))) 14))))
 
 (describe "migration: generated migrations round-trip"
   (test "a generated migration builds exactly the schema it came from"

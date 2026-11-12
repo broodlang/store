@@ -85,7 +85,8 @@
   (test "column is that column of every row"
     (assert= (repo/column (repo/open (fake-adaptor [{:id 1} {:id 2}]) {}) :users) [1 2]))
   (test "a row of several columns has no one value"
-    (assert (includes? (get (try (repo/value (repo/open (fake-adaptor [{:a 1 :b 2}]) {}) :users)
+    (assert (includes? (get (try
+                              (repo/value (repo/open (fake-adaptor [{:a 1 :b 2}]) {}) :users)
                               (catch e e))
                          :message)
               "one column"))))

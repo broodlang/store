@@ -273,7 +273,7 @@
           c)))))
 
 (defn- size-of (v)
-  (if (string? v) (string/length v) (count v)))
+  (if (string? v) (count v) (count v)))
 
 (defn validate-length (cs field opts)
   "A string's length (in characters) or a collection's count must satisfy `opts`:
@@ -321,7 +321,7 @@
   (validate-changed cs
     field
     (fn (v)
-      (if (regex/find pattern v)
+      (if (regex/find v pattern)
         nil
         [(get opts :message "has invalid format") {:validation :format}]))))
 

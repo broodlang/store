@@ -576,7 +576,7 @@
       "] for the column, or a string")))
 
 (defn- check-comparison (expr)
-  (let ([op left right] expr)
+  (let ([_op left right] expr)
     (when (nil? left) (check-operand expr left false))
     (check-operand expr right false)))
 

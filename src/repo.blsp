@@ -130,8 +130,10 @@
   "The one value of `row`, from a query selecting one column. A row is a map, whose keys are in
   no order, so a query naming several has no first column to give."
   (when (> (count row) 1)
-    (error "repo: value and column want a query selecting one column, not " (pr-str (keys row))
-      " — " (pr-str q)))
+    (error "repo: value and column want a query selecting one column, not "
+      (pr-str (keys row))
+      " — "
+      (pr-str q)))
   (first (vals row)))
 
 (defn value (repo q)
