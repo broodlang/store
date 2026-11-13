@@ -7,7 +7,7 @@
 ;; driver.
 (project
   :name "store"
-  :version "0.9.3"
+  :version "0.9.4"
   :brood ">= 0.51.0"
   :description
     "An adaptor-agnostic database storage library for Brood (Ecto-like): queries as plain data, schema, changeset, and a repo over a swappable driver."
