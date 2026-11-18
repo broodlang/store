@@ -57,7 +57,7 @@
   plain types map."
   (cond
     (nil? types-or-schema) {}
-    (contains? types-or-schema :fields)
+    (get types-or-schema :fields)
       (let (fields (get types-or-schema :fields))
         (reduce (keys fields)
           {}
@@ -69,7 +69,7 @@
                     (map? spec) (get spec :type)
                     (vector? spec) (first spec)
                     else spec))))))
-    else types-or-schema))
+    else (into {} types-or-schema)))
 
 (defn- blank? (v)
   (and (string? v) (= (string/trim v) "")))
