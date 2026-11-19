@@ -173,16 +173,14 @@
       (fn (cs field)
         (match (param-value incoming field)
           ([:absent] cs)
-          ([:present raw] (let (value (if (blank? raw) nil raw)
-                                converted (if (contains? types field)
-                                            (cast-value (get types field) value)
-                                            [:ok value]))
-                            (if (= converted :error)
-                              (add-error cs
-                                field
-                                "is invalid"
-                                {:validation :cast :type (get types field)})
-                              (put-change cs field (second converted))))))))))
+          ([:present raw]
+            (let (value (if (blank? raw) nil raw)
+                  converted (if (contains? types field)
+                              (cast-value (get types field) value)
+                              [:ok value]))
+              (if (= converted :error)
+                (add-error cs field "is invalid" {:validation :cast :type (get types field)})
+                (put-change cs field (second converted))))))))))
 
 ;; ---- reading -------------------------------------------------------------------
 
@@ -348,25 +346,25 @@
     (if (nil? value)
       cs
       (match (param-value (params cs) confirmation)
-        ([:present given] (if (= given value)
-                            cs
-                            (add-error cs
-                              confirmation
-                              (get opts :message "does not match confirmation")
-                              {:validation :confirmation})))
-        ([:absent] (if (get opts :required)
-                     (add-error cs confirmation "can't be blank" {:validation :required})
-                     cs))))))
+        ([:present given]
+          (if (= given value)
+            cs
+            (add-error cs
+              confirmation
+              (get opts :message "does not match confirmation")
+              {:validation :confirmation})))
+        ([:absent]
+          (if (get opts :required)
+            (add-error cs confirmation "can't be blank" {:validation :required})
+            cs))))))
 
 (defn validate-acceptance (cs field &optional (opts {}))
   "The param `field` must be sent as true (a ticked checkbox: `on`/`true`/`1`)."
   (match (param-value (params cs) field)
-    ([:present v] (if (= (cast-value :boolean v) [:ok true])
-                    cs
-                    (add-error cs
-                      field
-                      (get opts :message "must be accepted")
-                      {:validation :acceptance})))
+    ([:present v]
+      (if (= (cast-value :boolean v) [:ok true])
+        cs
+        (add-error cs field (get opts :message "must be accepted") {:validation :acceptance})))
     ([:absent] (add-error cs field (get opts :message "must be accepted") {:validation :acceptance}))))
 
 (defn validate-change (cs field check)

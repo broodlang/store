@@ -1369,10 +1369,12 @@
       (:limit [`(limit ~form)])
       (:offset [`(offset ~form)])
       (:distinct (if form [`(distinct)] []))
-      (:join [`(join ~(nth (join-form form) 1)
-                 ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
-      (:left-join [`(left-join ~(nth (join-form form) 1)
-                      ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
+      (:join
+        [`(join ~(nth (join-form form) 1)
+            ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
+      (:left-join
+        [`(left-join ~(nth (join-form form) 1)
+            ~(keyword (->string (nth form 0))) ~(clause-code (nth form 2) aliases))])
       (:union [`(union ~(clause-code form aliases))])
       (:union-all [`(union-all ~(clause-code form aliases))])
       (:lock (if (vector? form) [`(lock ~@form)] [`(lock ~form)])))))
