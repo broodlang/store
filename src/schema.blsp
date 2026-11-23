@@ -26,8 +26,7 @@
   database-specific column type (`:uuid`, `:jsonb`).
 
   The `*-sql` functions render the DDL the `migration` steps run."
-  (:alias query)
-  (:shadow fields))
+  (:alias query))
 
 (def *type-sql*
   {:integer "integer"

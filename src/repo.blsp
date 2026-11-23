@@ -28,8 +28,7 @@
   (:alias seq)
   (:alias string)
   (:alias schema)
-  (:alias changeset)
-  (:shadow update bound?))
+  (:alias changeset))
 
 (defn open (adaptor opts)
   "Open a repo over `adaptor` and connection `opts` (starts the adaptor's pool).
